@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Вместе — комната для двоих</title>
+<meta name="description" content="Закрытая комната с паролем: чат и показ любого окна компьютера прямо в браузере. Без установки и регистрации.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23070a12'/%3E%3Crect x='6' y='9' width='20' height='13' rx='2.5' fill='none' stroke='%23ffb257' stroke-width='2'/%3E%3Cpath d='M13 25h6' stroke='%23ffb257' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="screen" id="lobby">
+  <div class="lobby-wrap">
+    <header class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Вместе</span>
+      <span class="brand-tag">комната для двоих</span>
+    </header>
+
+    <main class="lobby-grid">
+      <section class="intro">
+        <h1>Один экран<br>на двоих</h1>
+        <p class="lede">Комната с паролем: чат и показ любого окна вашего компьютера прямо в браузере. Ничего не нужно устанавливать — ни вам, ни ей.</p>
+
+        <ul class="facts">
+          <li>
+            <b>Вход только по паролю</b>
+            <span>Название комнаты и пароль вместе превращаются в адрес в сети. Без пароля комнату не найти — не то что войти в неё.</span>
+          </li>
+          <li>
+            <b>Хоть окно, хоть весь экран</b>
+            <span>При запуске показа браузер предложит выбрать: отдельное окно с плеером, вкладку или весь рабочий стол.</span>
+          </li>
+          <li>
+            <b>На компьютере и на телефоне</b>
+            <span>Смотреть и переписываться можно с телефона в той же комнате. Показывать экран — с компьютера.</span>
+          </li>
+        </ul>
+      </section>
+
+      <section class="panel" aria-label="Вход в комнату">
+        <div class="panel-tabs" role="tablist">
+          <button type="button" class="tab is-active" data-tab="create" role="tab" aria-selected="true" id="tab-create">Создать комнату</button>
+          <button type="button" class="tab" data-tab="join" role="tab" aria-selected="false" id="tab-join">Войти</button>
+        </div>
+
+        <form id="create-form" class="pane" novalidate autocomplete="off">
+          <label class="field">
+            <span>Название комнаты</span>
+            <input id="c-room" name="c-room" type="text" maxlength="40" placeholder="вечер-сериал" autocomplete="off" required>
+          </label>
+          <label class="field">
+            <span>Пароль</span>
+            <input id="c-pass" name="c-pass" type="password" maxlength="80" placeholder="минимум 4 символа" autocomplete="new-password" required>
+          </label>
+          <label class="field">
+            <span>Ваше имя</span>
+            <input id="c-name" name="c-name" type="text" maxlength="24" placeholder="как показывать вас в чате" autocomplete="off">
+          </label>
+          <p class="form-error" id="create-error" role="alert" hidden></p>
+          <button class="btn btn-primary" id="create-btn" type="submit">Создать комнату</button>
+          <p class="form-note">Комната живёт, пока эта вкладка открыта. Ссылку можно отправить, а пароль — сказать отдельно.</p>
+        </form>
+
+        <form id="join-form" class="pane" novalidate autocomplete="off" hidden>
+          <label class="field">
+            <span>Название комнаты или ссылка</span>
+            <input id="j-room" name="j-room" type="text" maxlength="300" placeholder="вечер-сериал" autocomplete="off" required>
+          </label>
+          <label class="field">
+            <span>Пароль</span>
+            <input id="j-pass" name="j-pass" type="password" maxlength="80" placeholder="тот, что задал создатель" autocomplete="current-password" required>
+          </label>
+          <label class="field">
+            <span>Ваше имя</span>
+            <input id="j-name" name="j-name" type="text" maxlength="24" placeholder="как показывать вас в чате" autocomplete="off">
+          </label>
+          <p class="form-error" id="join-error" role="alert" hidden></p>
+          <button class="btn btn-primary" id="join-btn" type="submit">Войти в комнату</button>
+          <p class="form-note">Если комната «не найдена» — создатель ещё не открыл сайт или ошибся в пароле.</p>
+        </form>
+      </section>
+    </main>
+
+    <footer class="lobby-foot">
+      <span>Соединение напрямую между браузерами: переписка и видео не проходят через хранилища сайта.</span>
+      <span>Требуется HTTPS — GitHub Pages подходит.</span>
+    </footer>
+  </div>
+</div>
+
+<div class="screen room-screen" id="room" hidden>
+  <header class="roombar">
+    <div class="roombar-left">
+      <span class="brand-mark small" aria-hidden="true"></span>
+      <div class="room-meta">
+        <strong id="room-title">Комната</strong>
+        <span class="status"><i class="dot" id="status-dot"></i><span id="status-text">Подключение…</span></span>
+      </div>
+    </div>
+    <div class="roombar-right">
+      <button class="btn btn-ghost" id="invite-btn" type="button">Ссылка для жены</button>
+      <button class="btn btn-ghost btn-danger" id="leave-btn" type="button">Выйти</button>
+    </div>
+  </header>
+
+  <main class="stage-wrap">
+    <section class="stage" id="stage" aria-label="Показ экрана">
+      <div class="stage-view">
+        <video id="stage-video" class="stage-video" playsinline autoplay muted></video>
+
+        <div class="stage-empty" id="stage-empty">
+          <p class="stage-empty-title" id="stage-empty-title">Показ не начат</p>
+          <p class="stage-empty-sub" id="stage-empty-sub">Нажмите «Показать экран» и выберите окно с сериалом.</p>
+        </div>
+
+        <button class="sound-unlock" id="sound-unlock" type="button" hidden>Включить звук</button>
+      </div>
+
+      <div class="stage-bar">
+        <span class="viewers" id="viewers-line">Ждём гостей</span>
+        <div class="stage-actions">
+          <button class="btn btn-primary" id="share-btn" type="button" hidden>Показать экран</button>
+          <button class="btn btn-ghost" id="stop-btn" type="button" hidden>Остановить показ</button>
+          <button class="btn btn-ghost" id="mic-btn" type="button" aria-pressed="false">Микрофон</button>
+          <button class="btn btn-ghost" id="fs-btn" type="button">Во весь экран</button>
+        </div>
+      </div>
+    </section>
+
+    <aside class="chat" aria-label="Чат комнаты">
+      <header class="chat-head">
+        <span>Чат</span>
+        <span class="chat-count" id="chat-count"></span>
+      </header>
+      <div class="chat-messages" id="chat-messages" role="log" aria-live="polite"></div>
+      <form class="chat-form" id="chat-form" autocomplete="off">
+        <input id="chat-input" type="text" maxlength="1000" placeholder="Написать сообщение…" aria-label="Сообщение" autocomplete="off">
+        <button class="btn btn-primary chat-send" type="submit" aria-label="Отправить сообщение">Отправить</button>
+      </form>
+    </aside>
+  </main>
+
+  <audio id="guest-audio" autoplay></audio>
+</div>
+
+<div class="toast" id="toast" role="status" hidden></div>
+
+<noscript>
+  <p class="noscript">Для комнаты нужен JavaScript — включите его в браузере.</p>
+</noscript>
+
+<script src="app.js"></script>
+</body>
+</html>
