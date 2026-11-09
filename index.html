@@ -40,7 +40,8 @@
         </ul>
       </section>
 
-      <section class="panel" aria-label="Вход в комнату">
+      <div class="panel-slot">
+      <section class="panel" id="auth-panel" aria-label="Вход в комнату">
         <div class="panel-tabs" role="tablist">
           <button type="button" class="tab is-active" data-tab="create" role="tab" aria-selected="true" id="tab-create">Создать комнату</button>
           <button type="button" class="tab" data-tab="join" role="tab" aria-selected="false" id="tab-join">Войти</button>
@@ -81,7 +82,66 @@
           <button class="btn btn-primary" id="join-btn" type="submit">Войти в комнату</button>
           <p class="form-note">Если комната «не найдена» — создатель ещё не открыл сайт или ошибся в пароле.</p>
         </form>
+
+        <button class="link-btn manual-open" id="manual-open" type="button">Сервер не отвечает? Соединиться вручную</button>
       </section>
+
+      <section class="panel manual" id="manual-panel" aria-label="Соединение без сервера" hidden>
+        <div class="manual-top">
+          <h2>Без сервера</h2>
+          <button class="link-btn" id="manual-close" type="button">Назад</button>
+        </div>
+        <p class="form-note">Один раз обменяйтесь кодами через любой мессенджер. Дальше экран и чат идут напрямую, без сторонних сервисов.</p>
+
+        <div class="panel-tabs" role="tablist">
+          <button type="button" class="tab is-active" data-manual="host" role="tab" aria-selected="true" id="man-tab-host">Я показываю</button>
+          <button type="button" class="tab" data-manual="guest" role="tab" aria-selected="false" id="man-tab-guest">Я смотрю</button>
+        </div>
+
+        <div class="manual-pane" id="manual-host">
+          <label class="field">
+            <span>Ваше имя</span>
+            <input id="m-host-name" type="text" maxlength="24" placeholder="как показывать вас в чате">
+          </label>
+          <button class="btn btn-primary" id="m-create" type="button">Создать приглашение</button>
+
+          <div class="manual-step" id="m-host-step1" hidden>
+            <p class="manual-step-title">Шаг 1. Отправьте этот код жене</p>
+            <textarea id="m-invite" class="code-box" rows="4" readonly spellcheck="false" aria-label="Код приглашения"></textarea>
+            <button class="btn btn-ghost" id="m-copy-invite" type="button">Скопировать код</button>
+          </div>
+
+          <div class="manual-step" id="m-host-step2" hidden>
+            <p class="manual-step-title">Шаг 2. Вставьте ответный код</p>
+            <textarea id="m-answer-in" class="code-box" rows="3" spellcheck="false" placeholder="код, который пришлёт жена" aria-label="Ответный код"></textarea>
+            <button class="btn btn-primary" id="m-connect" type="button">Подключиться</button>
+          </div>
+
+          <p class="form-error" id="m-host-error" role="alert" hidden></p>
+        </div>
+
+        <div class="manual-pane" id="manual-guest" hidden>
+          <label class="field">
+            <span>Ваше имя</span>
+            <input id="m-guest-name" type="text" maxlength="24" placeholder="как показывать вас в чате">
+          </label>
+          <label class="field">
+            <span>Код приглашения</span>
+            <textarea id="m-invite-in" class="code-box" rows="4" spellcheck="false" placeholder="вставьте код от того, кто показывает" aria-label="Код приглашения"></textarea>
+          </label>
+          <button class="btn btn-primary" id="m-make-answer" type="button">Создать ответ</button>
+
+          <div class="manual-step" id="m-guest-step2" hidden>
+            <p class="manual-step-title">Отправьте этот код обратно</p>
+            <textarea id="m-answer-out" class="code-box" rows="4" readonly spellcheck="false" aria-label="Ответный код"></textarea>
+            <button class="btn btn-ghost" id="m-copy-answer" type="button">Скопировать код</button>
+            <p class="form-note">Как только он вставит код, соединение установится само.</p>
+          </div>
+
+          <p class="form-error" id="m-guest-error" role="alert" hidden></p>
+        </div>
+      </section>
+      </div>
     </main>
 
     <footer class="lobby-foot">

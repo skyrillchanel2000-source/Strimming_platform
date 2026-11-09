@@ -96,7 +96,22 @@ const state = {
   reconnecting: false,
 
   silentTrack: null,
-  audioCtx: null
+  audioCtx: null,
+
+  manualMode: false,
+  manual: {
+    role: null,
+    pc: null,
+    dc: null,
+    adapter: null,
+    videoTx: null,
+    systemTx: null,
+    micTx: null,
+    guestMicTx: null,
+    dummyTrack: null,
+    dummyCanvas: null,
+    connected: false
+  }
 };
 
 const timeFmt = new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit' });
@@ -146,14 +161,24 @@ function setStatus(kind, text) {
   statusText.textContent = text;
 }
 
+function errorNode(which) {
+  if (which === 'create') return createError;
+  if (which === 'join') return joinError;
+  if (which === 'm-host') return $('m-host-error');
+  if (which === 'm-guest') return $('m-guest-error');
+  return null;
+}
+
 function setError(which, message) {
-  const node = which === 'create' ? createError : joinError;
+  const node = errorNode(which);
+  if (!node) return;
   node.textContent = message;
   node.hidden = false;
 }
 
 function clearError(which) {
-  const node = which === 'create' ? createError : joinError;
+  const node = errorNode(which);
+  if (!node) return;
   node.hidden = true;
   node.textContent = '';
 }
@@ -448,7 +473,8 @@ function enterRoom() {
   roomEl.hidden = false;
   document.title = state.room + ' — Вместе';
   roomTitle.textContent = state.room;
-  history.replaceState(null, '', '#room=' + encodeURIComponent(state.room));
+  if (!state.manualMode) history.replaceState(null, '', '#room=' + encodeURIComponent(state.room));
+  inviteBtn.hidden = !!state.manualMode;
 
   stageVideo.muted = true;
 
@@ -456,13 +482,17 @@ function enterRoom() {
     updateShareButtons();
     setStagePlaceholder('Показ не начат', 'Нажмите «Показать экран» и выберите окно с сериалом или весь рабочий стол.');
     setStatus('online', 'Комната открыта');
-    addSystem('Комната открыта. Отправьте ссылку жене — пароль скажите отдельно.');
+    addSystem(state.manualMode
+      ? 'Соединение установлено напрямую. Нажмите «Показать экран».'
+      : 'Комната открыта. Отправьте ссылку жене — пароль скажите отдельно.');
   } else {
     shareBtn.hidden = true;
     stopBtn.hidden = true;
     setStagePlaceholder('Ждём показ', 'Как только начнётся трансляция, экран появится здесь.');
     setStatus('connecting', 'Вы в комнате');
-    addSystem('Вы вошли в комнату «' + state.room + '».');
+    addSystem(state.manualMode
+      ? 'Соединение установлено напрямую. Ждём показ.'
+      : 'Вы вошли в комнату «' + state.room + '».');
   }
 
   updateRoster();
@@ -674,6 +704,31 @@ async function startShare() {
 
   videoTrack.addEventListener('ended', () => stopShare());
 
+  if (state.manualMode) {
+    if (state.sharing) {
+      const previous = state.screenStream;
+      state.screenStream = stream;
+      stageVideo.srcObject = stream;
+      stageVideo.muted = true;
+      stageVideo.play().catch(() => {});
+      applyManualScreenTracks(stream);
+      if (previous) previous.getTracks().forEach((track) => track.stop());
+      toast('Источник показа заменён.');
+      return;
+    }
+    state.screenStream = stream;
+    state.sharing = true;
+    stageVideo.srcObject = stream;
+    stageVideo.muted = true;
+    stageVideo.play().catch(() => {});
+    stageEmpty.hidden = true;
+    updateShareButtons();
+    applyManualScreenTracks(stream);
+    sendManual({ t: 'share-started' });
+    addSystem('Показ экрана начат');
+    return;
+  }
+
   if (state.sharing) {
     replaceScreenStream(stream);
     return;
@@ -722,6 +777,18 @@ function stopShare() {
   state.sharing = false;
   if (state.screenStream) state.screenStream.getTracks().forEach((track) => track.stop());
   state.screenStream = null;
+
+  if (state.manualMode) {
+    if (state.manual.videoTx) state.manual.videoTx.sender.replaceTrack(getDummyVideoTrack()).catch(() => {});
+    const silent = getSilentTrack();
+    if (state.manual.systemTx && silent) state.manual.systemTx.sender.replaceTrack(silent).catch(() => {});
+    stageVideo.srcObject = null;
+    setStagePlaceholder('Показ остановлен', 'Нажмите «Показать экран», чтобы продолжить.');
+    updateShareButtons();
+    sendManual({ t: 'share-stopped' });
+    addSystem('Показ экрана остановлен');
+    return;
+  }
 
   state.guests.forEach((guest) => {
     closeGuestPC(guest);
@@ -873,10 +940,17 @@ function onHostMessage(msg) {
       handleHostIce(msg.c);
       break;
     }
+    case 'share-started': {
+      if (state.manualMode) {
+        stageEmpty.hidden = true;
+        setStatus('online', 'Показ идёт');
+      }
+      break;
+    }
     case 'share-stopped': {
       if (state.guestPC) guestStopPlayback();
       setStagePlaceholder('Показ остановлен', 'Как только хозяин снова включит показ, экран появится здесь.');
-      setStatus('online', 'Вы в комнате');
+      setStatus('online', state.manualMode ? 'Соединение установлено' : 'Вы в комнате');
       break;
     }
     case 'denied': {
@@ -1083,6 +1157,12 @@ async function toggleMic() {
 function applyMicTrack() {
   const track = state.micOn && state.micStream ? state.micStream.getAudioTracks()[0] : getSilentTrack();
 
+  if (state.manualMode) {
+    const tx = state.role === 'host' ? state.manual.micTx : state.micTx;
+    if (tx) tx.sender.replaceTrack(track || null).catch(() => {});
+    return;
+  }
+
   if (state.role === 'host') {
     state.guests.forEach((guest) => {
       if (guest.txs && guest.txs.mic) guest.txs.mic.sender.replaceTrack(track || null).catch(() => {});
@@ -1090,6 +1170,382 @@ function applyMicTrack() {
   } else if (state.micTx) {
     state.micTx.sender.replaceTrack(track || null).catch(() => {});
   }
+}
+
+/* ------------------------------------------------------------------
+   Ручное соединение: обмен кодами без сервера сигнализации
+   ------------------------------------------------------------------ */
+
+function getDummyVideoTrack() {
+  const m = state.manual;
+  if (m.dummyTrack) return m.dummyTrack;
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = 16;
+    canvas.height = 9;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.fillStyle = '#04060b';
+      ctx.fillRect(0, 0, 16, 9);
+    }
+    const stream = canvas.captureStream(1);
+    m.dummyCanvas = canvas;
+    m.dummyTrack = stream.getVideoTracks()[0] || null;
+  } catch (err) {
+    m.dummyTrack = null;
+  }
+  return m.dummyTrack;
+}
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(text) {
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function encodeCode(sdp) {
+  const bytes = new TextEncoder().encode(sdp);
+  if (typeof CompressionStream === 'function') {
+    try {
+      const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
+      const packed = new Uint8Array(await new Response(stream).arrayBuffer());
+      return 'V1g' + bytesToBase64(packed);
+    } catch (err) {
+      /* сжать не удалось — отдадим как есть */
+    }
+  }
+  return 'V1p' + bytesToBase64(bytes);
+}
+
+async function decodeCode(raw) {
+  const code = String(raw || '').replace(/\s+/g, '');
+  if (!/^V1[gp]/.test(code)) throw new Error('format');
+
+  const bytes = base64ToBytes(code.slice(3));
+  if (code.charAt(2) === 'p') return new TextDecoder().decode(bytes);
+  if (typeof DecompressionStream !== 'function') throw new Error('format');
+
+  try {
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+    return new TextDecoder().decode(await new Response(stream).arrayBuffer());
+  } catch (err) {
+    throw new Error('format');
+  }
+}
+
+function waitForIce(pc, timeout = 9000) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      pc.removeEventListener('icegatheringstatechange', check);
+      resolve();
+    };
+    const check = () => {
+      if (pc.iceGatheringState === 'complete') finish();
+    };
+    pc.addEventListener('icegatheringstatechange', check);
+    setTimeout(finish, timeout);
+  });
+}
+
+function channelAdapter(dc) {
+  return {
+    open: true,
+    send(message) {
+      if (dc.readyState === 'open') dc.send(JSON.stringify(message));
+    },
+    close() {
+      try { dc.close(); } catch (err) { /* уже закрыт */ }
+    }
+  };
+}
+
+async function copyText(text) {
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('Код скопирован.');
+  } catch (err) {
+    window.prompt('Скопируйте код:', text);
+  }
+}
+
+function resetManual() {
+  const m = state.manual;
+  const adapter = m.adapter;
+
+  if (m.pc) { try { m.pc.close(); } catch (err) { /* закрыт */ } }
+  if (m.dc) { try { m.dc.close(); } catch (err) { /* закрыт */ } }
+
+  m.role = null;
+  m.pc = null;
+  m.dc = null;
+  m.adapter = null;
+  m.videoTx = null;
+  m.systemTx = null;
+  m.micTx = null;
+  m.guestMicTx = null;
+  m.connected = false;
+
+  state.guests.delete('manual');
+  if (adapter && state.hostConn === adapter) state.hostConn = null;
+}
+
+function sendManual(message) {
+  send(state.manual.adapter, message);
+}
+
+function attachManualChannel(dc, role) {
+  const m = state.manual;
+  m.dc = dc;
+  m.adapter = channelAdapter(dc);
+
+  dc.onopen = () => {
+    if (role === 'host') {
+      state.guests.set('manual', {
+        id: 'manual',
+        name: 'Гость',
+        conn: m.adapter,
+        ready: true,
+        removed: false,
+        pc: null,
+        txs: null,
+        pendingCandidates: []
+      });
+      send(m.adapter, { t: 'welcome', hostName: state.name, room: 'Соединение напрямую' });
+      send(m.adapter, { t: 'roster', count: 2 });
+      updateRoster();
+    } else {
+      state.hostConn = m.adapter;
+      send(m.adapter, { t: 'hello', name: state.name });
+      updateRoster();
+    }
+  };
+
+  dc.onmessage = (event) => {
+    let message = null;
+    try { message = JSON.parse(event.data); } catch (err) { return; }
+    if (role === 'host') {
+      const guest = state.guests.get('manual');
+      if (guest) onGuestMessage(guest, message);
+    } else {
+      onHostMessage(message);
+    }
+  };
+
+  dc.onclose = () => {
+    if (state.inRoom) {
+      addSystem('Собеседник отключился. Обновите страницу, чтобы начать заново.');
+      setStatus('offline', 'Нет связи');
+    }
+  };
+}
+
+function switchManualTab(name) {
+  document.querySelectorAll('[data-manual]').forEach((tab) => {
+    const active = tab.dataset.manual === name;
+    tab.classList.toggle('is-active', active);
+    tab.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+  const hostPane = $('manual-host');
+  const guestPane = $('manual-guest');
+  if (hostPane) hostPane.hidden = name !== 'host';
+  if (guestPane) guestPane.hidden = name !== 'guest';
+}
+
+function playManualRemote() {
+  stageVideo.srcObject = state.remoteStream;
+  stageVideo.muted = false;
+  stageVideo.play().catch(() => {
+    stageVideo.muted = true;
+    stageVideo.play().catch(() => {});
+    soundUnlock.hidden = false;
+  });
+}
+
+function applyManualScreenTracks(stream) {
+  const m = state.manual;
+  const video = stream.getVideoTracks()[0];
+  const audio = stream.getAudioTracks()[0] || getSilentTrack();
+  if (m.videoTx && video) m.videoTx.sender.replaceTrack(video).catch(() => {});
+  if (m.systemTx && audio) m.systemTx.sender.replaceTrack(audio).catch(() => {});
+}
+
+async function manualCreateInvite() {
+  clearError('m-host');
+  state.name = cleanName($('m-host-name').value, 'Хозяин комнаты');
+  const btn = $('m-create');
+  btn.disabled = true;
+  btn.textContent = 'Готовим код…';
+
+  try {
+    resetManual();
+    state.manual.role = 'host';
+
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    state.manual.pc = pc;
+
+    const dummy = getDummyVideoTrack();
+    state.manual.videoTx = dummy
+      ? pc.addTransceiver(dummy, { direction: 'sendonly' })
+      : pc.addTransceiver('video', { direction: 'sendonly' });
+    state.manual.systemTx = addSendAudio(pc, getSilentTrack());
+    state.manual.micTx = addSendAudio(
+      pc,
+      state.micOn && state.micStream ? state.micStream.getAudioTracks()[0] : getSilentTrack()
+    );
+    state.manual.guestMicTx = pc.addTransceiver('audio', { direction: 'recvonly' });
+
+    attachManualChannel(pc.createDataChannel('vmeste', { ordered: true }), 'host');
+
+    pc.ontrack = (event) => {
+      if (event.track.kind !== 'audio') return;
+      if (!guestAudio.srcObject) guestAudio.srcObject = new MediaStream();
+      guestAudio.srcObject.addTrack(event.track);
+      guestAudio.play().catch(() => {});
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') {
+        state.manual.connected = true;
+        setStatus('online', 'Соединение установлено');
+      } else if (pc.connectionState === 'failed') {
+        setError('m-host', 'Соединение не установилось. Создайте приглашение заново.');
+      }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitForIce(pc);
+
+    $('m-invite').value = await encodeCode(pc.localDescription.sdp);
+    $('m-answer-in').value = '';
+    $('m-host-step1').hidden = false;
+    $('m-host-step2').hidden = false;
+    toast('Код готов — отправьте его жене.');
+  } catch (err) {
+    setError('m-host', 'Не удалось создать приглашение: ' + ((err && err.message) || 'ошибка'));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Создать приглашение';
+  }
+}
+
+async function manualConnectAnswer() {
+  clearError('m-host');
+  const raw = $('m-answer-in').value;
+  if (!raw.trim()) {
+    setError('m-host', 'Вставьте ответный код от жены.');
+    return;
+  }
+
+  const pc = state.manual.pc;
+  if (!pc) {
+    setError('m-host', 'Сначала создайте приглашение.');
+    return;
+  }
+
+  const btn = $('m-connect');
+  btn.disabled = true;
+  btn.textContent = 'Соединяем…';
+
+  try {
+    const sdp = await decodeCode(raw);
+    await pc.setRemoteDescription({ type: 'answer', sdp });
+    state.role = 'host';
+    state.manualMode = true;
+    state.room = 'Соединение напрямую';
+    state.inRoom = true;
+    enterRoom();
+    setStatus('online', 'Соединение установлено');
+  } catch (err) {
+    setError('m-host', 'Ответный код не подошёл. Скопируйте его целиком, без лишних символов.');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Подключиться';
+  }
+}
+
+async function manualMakeAnswer() {
+  clearError('m-guest');
+  state.name = cleanName($('m-guest-name').value, 'Гость');
+  const raw = $('m-invite-in').value;
+  if (!raw.trim()) {
+    setError('m-guest', 'Вставьте код приглашения от того, кто показывает.');
+    return;
+  }
+
+  const btn = $('m-make-answer');
+  btn.disabled = true;
+  btn.textContent = 'Готовим ответ…';
+
+  try {
+    resetManual();
+    state.manual.role = 'guest';
+
+    const sdp = await decodeCode(raw);
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    state.manual.pc = pc;
+    state.remoteStream = new MediaStream();
+
+    pc.ontrack = (event) => {
+      if (!state.remoteStream) state.remoteStream = new MediaStream();
+      state.remoteStream.addTrack(event.track);
+      playManualRemote();
+    };
+
+    pc.ondatachannel = (event) => attachManualChannel(event.channel, 'guest');
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') {
+        state.manual.connected = true;
+        enterManualRoom();
+      } else if (pc.connectionState === 'failed') {
+        setError('m-guest', 'Соединение не установилось. Попросите создать приглашение заново.');
+      }
+    };
+
+    await pc.setRemoteDescription({ type: 'offer', sdp });
+    await applyReverseDirections(pc, sdp);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await waitForIce(pc);
+
+    $('m-answer-out').value = await encodeCode(pc.localDescription.sdp);
+    $('m-guest-step2').hidden = false;
+    toast('Ответ готов — отправьте код обратно.');
+  } catch (err) {
+    const message = err && err.message === 'format'
+      ? 'Код не распознан. Скопируйте его из сообщения целиком.'
+      : 'Не удалось создать ответ: ' + ((err && err.message) || 'ошибка');
+    setError('m-guest', message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Создать ответ';
+  }
+}
+
+function enterManualRoom() {
+  if (state.inRoom) return;
+  state.role = 'guest';
+  state.manualMode = true;
+  state.room = 'Соединение напрямую';
+  state.inRoom = true;
+  enterRoom();
+  setStagePlaceholder('Ждём показ', 'Как только он включит показ, экран появится здесь.');
 }
 
 /* ------------------------------------------------------------------
@@ -1139,6 +1595,9 @@ function leaveRoom() {
   }
 
   if (state.micStream) state.micStream.getTracks().forEach((track) => track.stop());
+  if (state.manual.pc) { try { state.manual.pc.close(); } catch (err) { /* закрыт */ } }
+  if (state.manual.dc) { try { state.manual.dc.close(); } catch (err) { /* закрыт */ } }
+  if (state.manual.dummyTrack) { try { state.manual.dummyTrack.stop(); } catch (err) { /* закрыт */ } }
   if (state.peer) {
     try { state.peer.destroy(); } catch (err) { /* уже закрыт */ }
     state.peer = null;
@@ -1166,6 +1625,36 @@ function init() {
   fsBtn.addEventListener('click', toggleFullscreen);
   inviteBtn.addEventListener('click', copyInvite);
   leaveBtn.addEventListener('click', leaveRoom);
+
+  const manualOpen = $('manual-open');
+  const manualClose = $('manual-close');
+  if (manualOpen) {
+    manualOpen.addEventListener('click', () => {
+      $('auth-panel').hidden = true;
+      $('manual-panel').hidden = false;
+    });
+  }
+  if (manualClose) {
+    manualClose.addEventListener('click', () => {
+      resetManual();
+      $('manual-panel').hidden = true;
+      $('auth-panel').hidden = false;
+    });
+  }
+  document.querySelectorAll('[data-manual]').forEach((tab) => {
+    tab.addEventListener('click', () => switchManualTab(tab.dataset.manual));
+  });
+  const manualActions = [
+    ['m-create', manualCreateInvite],
+    ['m-connect', manualConnectAnswer],
+    ['m-make-answer', manualMakeAnswer],
+    ['m-copy-invite', () => copyText($('m-invite').value)],
+    ['m-copy-answer', () => copyText($('m-answer-out').value)]
+  ];
+  manualActions.forEach(([id, handler]) => {
+    const node = $(id);
+    if (node) node.addEventListener('click', handler);
+  });
 
   soundUnlock.addEventListener('click', () => {
     stageVideo.muted = false;

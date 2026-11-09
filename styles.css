@@ -644,6 +644,78 @@ ul { padding: 0; list-style: none; }
   text-align: center;
 }
 
+/* ---------- ручной режим ---------- */
+
+.panel-slot { min-width: 0; }
+
+.link-btn {
+  appearance: none;
+  border: 0;
+  background: none;
+  color: var(--blue);
+  font: inherit;
+  font-size: 13px;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.link-btn:hover { color: #a9c7ff; }
+
+.manual-open { margin-top: 14px; display: inline-block; }
+
+.manual-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.manual-top h2 {
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.manual .form-note { margin-bottom: 14px; }
+
+.manual-pane { display: grid; gap: 12px; }
+
+.manual-step {
+  display: grid;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--line-strong);
+}
+
+.manual-step-title {
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.code-box {
+  width: 100%;
+  background: rgba(6, 9, 16, 0.72);
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  color: #c6d4ea;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.45;
+  padding: 9px 11px;
+  resize: vertical;
+  word-break: break-all;
+}
+
+.code-box:focus {
+  outline: none;
+  border-color: rgba(255, 178, 87, 0.6);
+  box-shadow: 0 0 0 3px rgba(255, 178, 87, 0.12);
+}
+
 /* ---------- адаптив ---------- */
 
 @media (max-width: 980px) {
