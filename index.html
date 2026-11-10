@@ -185,6 +185,28 @@
           <button class="btn btn-primary" id="share-btn" type="button" hidden>Показать экран</button>
           <button class="btn btn-ghost" id="stop-btn" type="button" hidden>Остановить показ</button>
           <button class="btn btn-ghost" id="mic-btn" type="button" aria-pressed="false">Микрофон</button>
+
+          <div class="mixer" id="mixer">
+            <button class="btn btn-ghost mixer-toggle" id="mixer-btn" type="button" aria-expanded="false" aria-controls="mixer-panel">Громкость <span class="mixer-badge" id="mixer-badge">100%</span></button>
+            <div class="mixer-panel" id="mixer-panel" role="group" aria-label="Микшер громкости" hidden>
+              <div class="mixer-row">
+                <span class="mixer-label">Собеседник</span>
+                <output class="mixer-value" id="voice-volume-out" for="voice-volume">100%</output>
+                <input class="mixer-range" id="voice-volume" type="range" min="0" max="300" step="5" value="100" aria-label="Громкость собеседника">
+              </div>
+              <div class="mixer-row" id="system-volume-row">
+                <span class="mixer-label">Звук показа</span>
+                <output class="mixer-value" id="system-volume-out" for="system-volume">100%</output>
+                <input class="mixer-range" id="system-volume" type="range" min="0" max="100" step="5" value="100" aria-label="Громкость звука показа">
+              </div>
+              <p class="mixer-note">Выше 100% голос усиливается — на очень громком звуке возможны искажения.</p>
+              <div class="mixer-foot">
+                <button class="link-btn" id="voice-mute" type="button" aria-pressed="false">Заглушить</button>
+                <button class="link-btn" id="mixer-reset" type="button">Сбросить</button>
+              </div>
+            </div>
+          </div>
+
           <button class="btn btn-ghost" id="fs-btn" type="button">Во весь экран</button>
         </div>
       </div>

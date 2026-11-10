@@ -65,6 +65,18 @@ const chatCount = $('chat-count');
 const guestAudio = $('guest-audio');
 const toastEl = $('toast');
 
+const mixerEl = $('mixer');
+const mixerBtn = $('mixer-btn');
+const mixerBadge = $('mixer-badge');
+const mixerPanel = $('mixer-panel');
+const voiceVolume = $('voice-volume');
+const voiceVolumeOut = $('voice-volume-out');
+const systemVolumeRow = $('system-volume-row');
+const systemVolume = $('system-volume');
+const systemVolumeOut = $('system-volume-out');
+const voiceMuteBtn = $('voice-mute');
+const mixerReset = $('mixer-reset');
+
 /* ------------------------------------------------------------------
    Состояние
    ------------------------------------------------------------------ */
@@ -97,6 +109,21 @@ const state = {
 
   silentTrack: null,
   audioCtx: null,
+
+  remoteVoiceMid: null,
+
+  mixer: {
+    ctx: null,
+    voiceGain: null,
+    systemGain: null,
+    voiceTracks: new Map(),
+    voiceSources: new Map(),
+    systemTrack: null,
+    systemSource: null,
+    voice: 1,
+    system: 1,
+    lastVoice: 1
+  },
 
   manualMode: false,
   manual: {
@@ -477,6 +504,7 @@ function enterRoom() {
   inviteBtn.hidden = !!state.manualMode;
 
   stageVideo.muted = true;
+  renderMixer();
 
   if (state.role === 'host') {
     updateShareButtons();
@@ -845,9 +873,8 @@ async function offerToGuest(guest) {
 
   pc.ontrack = (event) => {
     if (event.track.kind !== 'audio') return;
-    if (!guestAudio.srcObject) guestAudio.srcObject = new MediaStream();
-    guestAudio.srcObject.addTrack(event.track);
-    guestAudio.play().catch(() => {});
+    guest.voiceTrack = event.track;
+    attachVoiceTrack(event.track);
   };
 
   pc.onconnectionstatechange = () => {
@@ -901,6 +928,10 @@ function closeGuestPC(guest) {
     guest.pc = null;
     guest.txs = null;
     guest.pendingCandidates = [];
+    if (guest.voiceTrack) {
+      detachVoiceTrack(guest.voiceTrack.id);
+      guest.voiceTrack = null;
+    }
   }
 }
 
@@ -974,6 +1005,7 @@ async function handleHostOffer(sdp) {
   state.guestPC = pc;
   state.pendingCandidates = earlyCandidates;
   state.remoteStream = new MediaStream();
+  state.remoteVoiceMid = findVoiceMid(sdp);
 
   pc.onicecandidate = (event) => {
     if (event.candidate) send(state.hostConn, { t: 'ice', c: event.candidate.toJSON() });
@@ -981,7 +1013,12 @@ async function handleHostOffer(sdp) {
 
   pc.ontrack = (event) => {
     if (!state.remoteStream) state.remoteStream = new MediaStream();
+    if (event.track.kind === 'audio' && isVoiceTransceiver(event.transceiver)) {
+      attachVoiceTrack(event.track);
+      return;
+    }
     state.remoteStream.addTrack(event.track);
+    if (event.track.kind === 'audio') attachSystemTrack(event.track);
     playRemoteStream();
   };
 
@@ -1052,8 +1089,25 @@ function parseMediaSections(sdp) {
     const space = part.indexOf(' ');
     const kind = space === -1 ? part : part.slice(0, space);
     const match = part.match(/\r\na=(sendrecv|sendonly|recvonly|inactive)/);
-    return { kind, direction: match ? match[1] : 'sendrecv' };
+    const mid = part.match(/(?:^|\r\n)a=mid:([^\r\n]+)/);
+    return { kind, direction: match ? match[1] : 'sendrecv', mid: mid ? mid[1].trim() : null };
   });
+}
+
+/*
+  В предложении хозяина порядок дорожек: видео, звук показа, микрофон хозяина,
+  пустая дорожка под микрофон гостя. Голос собеседника — последняя sendonly-аудиодорожка.
+*/
+function findVoiceMid(sdp) {
+  const audio = parseMediaSections(sdp)
+    .filter((line) => line.kind === 'audio' && line.direction === 'sendonly');
+  const voice = audio[audio.length - 1];
+  return voice && voice.mid ? voice.mid : null;
+}
+
+function isVoiceTransceiver(tx) {
+  if (!tx || tx.mid == null || state.remoteVoiceMid == null) return false;
+  return String(tx.mid) === String(state.remoteVoiceMid);
 }
 
 function reverseDirection(direction) {
@@ -1064,17 +1118,19 @@ function reverseDirection(direction) {
 
 function playRemoteStream() {
   stageVideo.srcObject = state.remoteStream;
-  stageVideo.muted = false;
+  stageVideo.muted = !!state.mixer.systemSource;
+  stageVideo.volume = state.mixer.system;
   stageVideo.play()
     .then(() => {
       stageEmpty.hidden = true;
-      soundUnlock.hidden = true;
+      refreshSoundUnlock();
     })
     .catch(() => {
       stageVideo.muted = true;
       stageVideo.play().catch(() => {});
-      soundUnlock.hidden = false;
       stageEmpty.hidden = true;
+      if (!state.mixer.ctx) soundUnlock.hidden = false;
+      refreshSoundUnlock();
     });
 }
 
@@ -1095,7 +1151,10 @@ function guestStopPlayback() {
   state.guestPC = null;
   state.micTx = null;
   state.remoteStream = null;
+  state.remoteVoiceMid = null;
   state.pendingCandidates = [];
+  detachVoice();
+  detachSystemTrack();
   stageVideo.srcObject = null;
   soundUnlock.hidden = true;
 }
@@ -1139,7 +1198,11 @@ async function toggleMic() {
       return;
     }
   } else {
-    if (state.micStream) state.micStream.getTracks().forEach((track) => track.stop());
+  detachVoice();
+  detachSystemTrack();
+
+  if (state.micStream) state.micStream.getTracks().forEach((track) => track.stop());
+
     state.micStream = null;
     state.micOn = false;
   }
@@ -1147,6 +1210,7 @@ async function toggleMic() {
   if (state.audioCtx && state.audioCtx.state === 'suspended') {
     state.audioCtx.resume().catch(() => {});
   }
+  tryResumeMixer();
 
   micBtn.classList.toggle('is-on', state.micOn);
   micBtn.setAttribute('aria-pressed', state.micOn ? 'true' : 'false');
@@ -1170,6 +1234,290 @@ function applyMicTrack() {
   } else if (state.micTx) {
     state.micTx.sender.replaceTrack(track || null).catch(() => {});
   }
+}
+
+/* ------------------------------------------------------------------
+   Микшер громкости: голос собеседника и звук показа
+   ------------------------------------------------------------------ */
+
+const MIXER_STORAGE_KEY = 'vmeste.mixer';
+
+function clampValue(value, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return min;
+  return Math.min(max, Math.max(min, number));
+}
+
+function ensureAudioCtx() {
+  if (state.mixer.ctx) return state.mixer.ctx;
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) return null;
+  try {
+    state.mixer.ctx = new AudioCtx();
+  } catch (err) {
+    return null;
+  }
+  const ctx = state.mixer.ctx;
+  if (ctx.addEventListener) ctx.addEventListener('statechange', refreshSoundUnlock);
+  return ctx;
+}
+
+function ensureMixerGain(kind) {
+  const ctx = ensureAudioCtx();
+  if (!ctx) return null;
+  const m = state.mixer;
+  const key = kind === 'voice' ? 'voiceGain' : 'systemGain';
+  if (m[key]) return m[key];
+  const gain = ctx.createGain();
+  gain.gain.value = kind === 'voice' ? m.voice : m.system;
+  gain.connect(ctx.destination);
+  m[key] = gain;
+  return gain;
+}
+
+function applyGain(kind) {
+  const m = state.mixer;
+  const gain = kind === 'voice' ? m.voiceGain : m.systemGain;
+  if (!gain) return;
+  const value = kind === 'voice' ? m.voice : m.system;
+  try {
+    if (m.ctx && gain.gain.setTargetAtTime) {
+      gain.gain.setTargetAtTime(value, m.ctx.currentTime, 0.015);
+    } else {
+      gain.gain.value = value;
+    }
+  } catch (err) {
+    gain.gain.value = value;
+  }
+}
+
+function attachVoiceTrack(track) {
+  if (!track) return;
+  const m = state.mixer;
+  if (m.voiceTracks.has(track.id)) return;
+
+  m.voiceTracks.set(track.id, track);
+  track.addEventListener('ended', () => detachVoiceTrack(track.id));
+
+  const gain = ensureMixerGain('voice');
+  let source = null;
+  if (gain && m.ctx) {
+    try {
+      source = m.ctx.createMediaStreamSource(new MediaStream([track]));
+      source.connect(gain);
+    } catch (err) {
+      source = null;
+    }
+  }
+
+  if (source) {
+    m.voiceSources.set(track.id, source);
+    stopElementVoice();
+  } else {
+    addElementVoice(track);
+  }
+
+  refreshSoundUnlock();
+}
+
+function detachVoiceTrack(id) {
+  const m = state.mixer;
+  const source = m.voiceSources.get(id);
+  if (source) {
+    try { source.disconnect(); } catch (err) { /* уже отключён */ }
+    m.voiceSources.delete(id);
+  }
+  m.voiceTracks.delete(id);
+
+  if (guestAudio && guestAudio.srcObject) {
+    const track = guestAudio.srcObject.getTracks().find((item) => item.id === id);
+    if (track) guestAudio.srcObject.removeTrack(track);
+  }
+}
+
+function detachVoice() {
+  const m = state.mixer;
+  m.voiceSources.forEach((source) => {
+    try { source.disconnect(); } catch (err) { /* уже отключён */ }
+  });
+  m.voiceSources.clear();
+  m.voiceTracks.clear();
+  stopElementVoice();
+}
+
+function stopElementVoice() {
+  if (!guestAudio) return;
+  guestAudio.pause();
+  guestAudio.srcObject = null;
+  guestAudio.muted = true;
+}
+
+function addElementVoice(track) {
+  if (!guestAudio) return;
+  if (!guestAudio.srcObject) guestAudio.srcObject = new MediaStream();
+  guestAudio.srcObject.addTrack(track);
+  guestAudio.muted = false;
+  guestAudio.volume = Math.min(1, state.mixer.voice);
+  guestAudio.play().catch(() => {});
+}
+
+function attachSystemTrack(track) {
+  if (!track) return;
+  const m = state.mixer;
+  if (m.systemTrack && m.systemTrack.id === track.id) return;
+
+  detachSystemTrack();
+  m.systemTrack = track;
+
+  const gain = ensureMixerGain('system');
+  if (gain && m.ctx) {
+    try {
+      m.systemSource = m.ctx.createMediaStreamSource(new MediaStream([track]));
+      m.systemSource.connect(gain);
+    } catch (err) {
+      m.systemSource = null;
+    }
+  }
+
+  if (stageVideo) {
+    stageVideo.muted = !!m.systemSource;
+    if (!m.systemSource) stageVideo.volume = m.system;
+  }
+  refreshSoundUnlock();
+}
+
+function detachSystemTrack() {
+  const m = state.mixer;
+  if (m.systemSource) {
+    try { m.systemSource.disconnect(); } catch (err) { /* уже отключён */ }
+  }
+  m.systemSource = null;
+  m.systemTrack = null;
+  if (stageVideo) stageVideo.muted = true;
+}
+
+function setVoiceLevel(value, options) {
+  const m = state.mixer;
+  const next = clampValue(value, 0, 3);
+  if (next > 0) m.lastVoice = next;
+  m.voice = next;
+
+  applyGain('voice');
+  if (!m.voiceSources.size && guestAudio && guestAudio.srcObject && !guestAudio.muted) {
+    guestAudio.volume = Math.min(1, next);
+  }
+  renderMixer();
+  if (options && options.save) saveMixerState();
+}
+
+function setSystemLevel(value, options) {
+  const m = state.mixer;
+  m.system = clampValue(value, 0, 1);
+
+  applyGain('system');
+  if (!m.systemSource && stageVideo) stageVideo.volume = m.system;
+  renderMixer();
+  if (options && options.save) saveMixerState();
+}
+
+function toggleVoiceMute() {
+  const muted = state.mixer.voice === 0;
+  setVoiceLevel(muted ? (state.mixer.lastVoice || 1) : 0, { save: true });
+}
+
+function resetMixer() {
+  setVoiceLevel(1, { save: true });
+  setSystemLevel(1, { save: true });
+}
+
+function renderMixer() {
+  const m = state.mixer;
+  const voicePercent = Math.round(m.voice * 100);
+  const systemPercent = Math.round(m.system * 100);
+
+  if (voiceVolume) voiceVolume.value = String(voicePercent);
+  if (voiceVolumeOut) voiceVolumeOut.textContent = voicePercent + '%';
+  if (systemVolume) systemVolume.value = String(systemPercent);
+  if (systemVolumeOut) systemVolumeOut.textContent = systemPercent + '%';
+  if (mixerBadge) mixerBadge.textContent = m.voice === 0 ? 'выкл' : voicePercent + '%';
+  if (systemVolumeRow) systemVolumeRow.hidden = state.role !== 'guest';
+
+  if (voiceMuteBtn) {
+    const muted = m.voice === 0;
+    voiceMuteBtn.textContent = muted ? 'Включить голос' : 'Заглушить';
+    voiceMuteBtn.setAttribute('aria-pressed', muted ? 'true' : 'false');
+    voiceMuteBtn.classList.toggle('is-on', muted);
+  }
+}
+
+function refreshSoundUnlock() {
+  if (!soundUnlock) return;
+  const m = state.mixer;
+  const mixing = !!(m.voiceSources.size || m.systemSource);
+  soundUnlock.hidden = !(mixing && m.ctx && m.ctx.state === 'suspended');
+}
+
+function tryResumeMixer() {
+  const ctx = state.mixer.ctx;
+  if (!ctx) return;
+  if (ctx.state === 'running') {
+    refreshSoundUnlock();
+    return;
+  }
+  const done = () => refreshSoundUnlock();
+  try {
+    const result = ctx.resume();
+    if (result && typeof result.then === 'function') result.then(done).catch(done);
+    else done();
+  } catch (err) {
+    done();
+  }
+}
+
+function primeAudio() {
+  ensureAudioCtx();
+  tryResumeMixer();
+}
+
+function unlockSound() {
+  tryResumeMixer();
+  if (guestAudio && guestAudio.srcObject && guestAudio.paused) guestAudio.play().catch(() => {});
+  if (state.role === 'guest' && stageVideo.paused) stageVideo.play().catch(() => {});
+}
+
+function saveMixerState() {
+  try {
+    localStorage.setItem(MIXER_STORAGE_KEY, JSON.stringify({
+      voice: state.mixer.voice,
+      system: state.mixer.system
+    }));
+  } catch (err) {
+    /* приватный режим или хранилище недоступно */
+  }
+}
+
+function loadMixerState() {
+  try {
+    const raw = localStorage.getItem(MIXER_STORAGE_KEY);
+    if (!raw) return;
+    const data = JSON.parse(raw);
+    if (data && typeof data.voice === 'number') {
+      state.mixer.voice = clampValue(data.voice, 0, 3);
+      if (state.mixer.voice > 0) state.mixer.lastVoice = state.mixer.voice;
+    }
+    if (data && typeof data.system === 'number') {
+      state.mixer.system = clampValue(data.system, 0, 1);
+    }
+  } catch (err) {
+    /* повреждённые настройки — остаются значения по умолчанию */
+  }
+}
+
+function toggleMixerPanel(force) {
+  if (!mixerPanel || !mixerBtn) return;
+  const open = typeof force === 'boolean' ? force : mixerPanel.hidden;
+  mixerPanel.hidden = !open;
+  mixerBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
 }
 
 /* ------------------------------------------------------------------
@@ -1300,6 +1648,9 @@ function resetManual() {
   m.guestMicTx = null;
   m.connected = false;
 
+  detachVoice();
+  detachSystemTrack();
+
   state.guests.delete('manual');
   if (adapter && state.hostConn === adapter) state.hostConn = null;
 }
@@ -1368,12 +1719,14 @@ function switchManualTab(name) {
 
 function playManualRemote() {
   stageVideo.srcObject = state.remoteStream;
-  stageVideo.muted = false;
+  stageVideo.muted = !!state.mixer.systemSource;
+  stageVideo.volume = state.mixer.system;
   stageVideo.play().catch(() => {
     stageVideo.muted = true;
     stageVideo.play().catch(() => {});
-    soundUnlock.hidden = false;
+    if (!state.mixer.ctx) soundUnlock.hidden = false;
   });
+  refreshSoundUnlock();
 }
 
 function applyManualScreenTracks(stream) {
@@ -1413,9 +1766,7 @@ async function manualCreateInvite() {
 
     pc.ontrack = (event) => {
       if (event.track.kind !== 'audio') return;
-      if (!guestAudio.srcObject) guestAudio.srcObject = new MediaStream();
-      guestAudio.srcObject.addTrack(event.track);
-      guestAudio.play().catch(() => {});
+      attachVoiceTrack(event.track);
     };
 
     pc.onconnectionstatechange = () => {
@@ -1500,10 +1851,16 @@ async function manualMakeAnswer() {
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
     state.manual.pc = pc;
     state.remoteStream = new MediaStream();
+    state.remoteVoiceMid = findVoiceMid(sdp);
 
     pc.ontrack = (event) => {
       if (!state.remoteStream) state.remoteStream = new MediaStream();
+      if (event.track.kind === 'audio' && isVoiceTransceiver(event.transceiver)) {
+        attachVoiceTrack(event.track);
+        return;
+      }
       state.remoteStream.addTrack(event.track);
+      if (event.track.kind === 'audio') attachSystemTrack(event.track);
       playManualRemote();
     };
 
@@ -1626,6 +1983,32 @@ function init() {
   inviteBtn.addEventListener('click', copyInvite);
   leaveBtn.addEventListener('click', leaveRoom);
 
+  loadMixerState();
+  renderMixer();
+
+  if (mixerBtn) mixerBtn.addEventListener('click', () => toggleMixerPanel());
+  if (voiceVolume) {
+    voiceVolume.addEventListener('input', () => {
+      setVoiceLevel(Number(voiceVolume.value) / 100, { save: true });
+    });
+  }
+  if (systemVolume) {
+    systemVolume.addEventListener('input', () => {
+      setSystemLevel(Number(systemVolume.value) / 100, { save: true });
+    });
+  }
+  if (voiceMuteBtn) voiceMuteBtn.addEventListener('click', toggleVoiceMute);
+  if (mixerReset) mixerReset.addEventListener('click', resetMixer);
+
+  document.addEventListener('click', (event) => {
+    if (!mixerPanel || mixerPanel.hidden) return;
+    if (mixerEl && mixerEl.contains(event.target)) return;
+    toggleMixerPanel(false);
+  });
+
+  document.addEventListener('pointerdown', primeAudio, { passive: true });
+  document.addEventListener('keydown', primeAudio);
+
   const manualOpen = $('manual-open');
   const manualClose = $('manual-close');
   if (manualOpen) {
@@ -1656,15 +2039,15 @@ function init() {
     if (node) node.addEventListener('click', handler);
   });
 
-  soundUnlock.addEventListener('click', () => {
-    stageVideo.muted = false;
-    stageVideo.play().then(() => {
-      soundUnlock.hidden = true;
-    }).catch(() => {});
-  });
+  soundUnlock.addEventListener('click', unlockSound);
 
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && document.fullscreenElement) {
+    if (event.key !== 'Escape') return;
+    if (mixerPanel && !mixerPanel.hidden) {
+      toggleMixerPanel(false);
+      return;
+    }
+    if (document.fullscreenElement) {
       document.exitFullscreen().catch(() => {});
     }
   });
