@@ -24,7 +24,7 @@ const PEER_LIB_URLS = [
 
 const MAX_GUESTS = 6;
 const ROOM_ID_PREFIX = 'vmeste-';
-const APP_VERSION = '2026-11-11.2';
+const APP_VERSION = '2026-11-11.3';
 
 /* ------------------------------------------------------------------
    Элементы страницы
@@ -86,6 +86,7 @@ const micSelect = $('mic-select');
 const micMeterBar = $('mic-meter-bar');
 const micHint = $('mic-hint');
 const micStatus = $('mic-status');
+const audioDiagnose = $('audio-diagnose');
 const versionEl = $('app-version');
 
 /* ------------------------------------------------------------------
@@ -1131,6 +1132,7 @@ async function handleHostOffer(sdp) {
     await pc.setLocalDescription(answer);
     send(state.hostConn, { t: 'answer', sdp: pc.localDescription.sdp });
     applyMicTrack();
+    scheduleIncomingVoiceCheck();
 
     const pending = state.pendingCandidates;
     state.pendingCandidates = [];
@@ -1252,6 +1254,44 @@ function guestStopPlayback() {
   stageVideo.srcObject = null;
   soundUnlock.hidden = true;
   updateMicStatus();
+}
+
+/*
+  Гость ищет голос собеседника по разметке SDP. Если разбор не совпал с живым
+  потоком (необычный SDP, другой браузер), включаем резервный путь: берём
+  последнюю входящую аудиодорожку, кроме звука показа.
+*/
+function ensureIncomingVoice() {
+  if (state.role !== 'guest') return;
+  const m = state.mixer;
+  if (m.voiceTracks.size) return;
+
+  const pc = state.manualMode ? state.manual.pc : state.guestPC;
+  if (!pc || pc.connectionState !== 'connected') return;
+
+  const incoming = pc.getTransceivers().filter((tx) => (
+    tx.receiver
+      && tx.receiver.track
+      && tx.receiver.track.kind === 'audio'
+      && (tx.currentDirection === 'recvonly' || tx.currentDirection === 'sendrecv')
+      && (!m.systemTrack || tx.receiver.track.id !== m.systemTrack.id)
+  ));
+
+  const pick = incoming.length ? incoming[incoming.length - 1] : null;
+  if (pick && pick.receiver.track.readyState === 'live') {
+    attachVoiceTrack(pick.receiver.track);
+    if (m.voiceTracks.size) {
+      addSystem('Голос собеседника подключён по резервной дорожке (mid=' + pick.mid + ').');
+      return;
+    }
+  }
+
+  addSystem('Голос собеседника не приходит: дорожка микрофона не найдена. Нажмите «Диагностика звука» в панели микрофона и пришлите отчёт.');
+}
+
+function scheduleIncomingVoiceCheck() {
+  setTimeout(ensureIncomingVoice, 7000);
+  setTimeout(ensureIncomingVoice, 14000);
 }
 
 /* ------------------------------------------------------------------
@@ -1461,6 +1501,94 @@ function stopMicMeter() {
   if (micMeterBar) micMeterBar.style.width = '0%';
 }
 
+/* ------------------------------------------------------------------
+   Диагностика звука: где именно теряется голос
+   ------------------------------------------------------------------ */
+
+function trackSummary(track) {
+  if (!track) return 'нет дорожки';
+  return track.kind + '/' + track.readyState + (track.muted ? '/muted' : '') + (track.enabled ? '' : '/disabled');
+}
+
+async function audioStatsRows(pc) {
+  if (!pc) return ['статистики нет: соединения нет'];
+  const rows = [];
+  try {
+    const stats = await pc.getStats();
+    stats.forEach((report) => {
+      const audio = report.kind === 'audio' || report.mediaType === 'audio';
+      if (report.type === 'inbound-rtp' && audio) {
+        rows.push('вход mid=' + report.mid + ': ' + (report.bytesReceived || 0) + ' Б');
+      }
+      if (report.type === 'outbound-rtp' && audio) {
+        rows.push('выход mid=' + report.mid + ': ' + (report.bytesSent || 0) + ' Б');
+      }
+    });
+  } catch (err) {
+    return ['статистика недоступна'];
+  }
+  return rows.length ? rows : ['аудиопотоков нет'];
+}
+
+async function buildAudioReport() {
+  const m = state.mixer;
+  const lines = [];
+  lines.push('Версия: ' + APP_VERSION);
+  lines.push('Роль: ' + (state.role || '—') + (state.manualMode ? ', без сервера' : ''));
+  lines.push('Браузер: ' + navigator.userAgent);
+
+  const micTrack = state.micStream ? state.micStream.getAudioTracks()[0] : null;
+  lines.push('Микрофон: ' + (state.micOn ? trackSummary(micTrack) : 'выключен'));
+  lines.push('Микшер: ' + (m.ctx ? 'AudioContext ' + m.ctx.state : 'AudioContext нет')
+    + ', голос ' + Math.round(m.voice * 100) + '%'
+    + ', источников ' + m.voiceSources.size
+    + ', дорожек ' + m.voiceTracks.size);
+  const voiceTracks = Array.from(m.voiceTracks.values());
+  lines.push('Голосовые дорожки: ' + (voiceTracks.length ? voiceTracks.map(trackSummary).join(', ') : '—'));
+  lines.push('Звук показа: ' + (m.systemTrack ? trackSummary(m.systemTrack) : '—'));
+
+  if (state.role === 'host') {
+    if (!state.guests.size) lines.push('Гости: нет');
+    state.guests.forEach((guest) => {
+      const tx = guest.txs || {};
+      lines.push('Гость ' + guest.name + ': соединение ' + (guest.pc ? guest.pc.connectionState : '—')
+        + '; мой микрофон mid=' + (tx.mic ? tx.mic.mid : '—') + ' ' + (tx.mic ? tx.mic.currentDirection : '')
+        + ' (' + trackSummary(tx.mic && tx.mic.sender && tx.mic.sender.track) + ')'
+        + '; его микрофон mid=' + (tx.guestMic ? tx.guestMic.mid : '—') + ' ' + (tx.guestMic ? tx.guestMic.currentDirection : ''));
+    });
+    const hostPc = state.manual.pc;
+    if (hostPc) {
+      lines.push('Прямое соединение: ' + hostPc.connectionState);
+      (await audioStatsRows(hostPc)).forEach((row) => lines.push('  ' + row));
+    }
+    for (const guest of state.guests.values()) {
+      (await audioStatsRows(guest.pc)).forEach((row) => lines.push('  ' + row));
+    }
+  } else {
+    const pc = state.manualMode ? state.manual.pc : state.guestPC;
+    const tx = state.micTx;
+    lines.push('Соединение: ' + (pc ? pc.connectionState : 'нет'));
+    lines.push('Мой микрофон: mid=' + (tx ? tx.mid : '—') + ' ' + (tx ? tx.currentDirection : '')
+      + ' (' + trackSummary(tx && tx.sender && tx.sender.track) + ')');
+    lines.push('Голос собеседника: mid=' + (state.remoteVoiceMid == null ? '—' : state.remoteVoiceMid));
+    (await audioStatsRows(pc)).forEach((row) => lines.push('  ' + row));
+  }
+
+  return lines.join('\n');
+}
+
+async function runAudioDiagnostics() {
+  let report = '';
+  try {
+    report = await buildAudioReport();
+  } catch (err) {
+    report = 'Не удалось собрать отчёт: ' + ((err && err.message) || 'ошибка');
+  }
+  if (window.console && console.log) console.log(report);
+  addSystem('Диагностика звука: ' + report.split('\n').join(' · '));
+  copyText(report);
+}
+
 async function switchMicDevice() {
   if (!state.micOn) {
     updateMicPanel();
@@ -1657,27 +1785,42 @@ function attachVoiceTrack(track) {
   m.voiceTracks.set(track.id, track);
   track.addEventListener('ended', () => detachVoiceTrack(track.id));
 
-  const gain = ensureMixerGain('voice');
-  let source = null;
-  if (gain && m.ctx) {
-    const destination = ensureVoiceAnalyser() || gain;
-    try {
-      source = m.ctx.createMediaStreamSource(new MediaStream([track]));
-      source.connect(destination);
-    } catch (err) {
-      source = null;
-    }
-  }
-
-  if (source) {
-    m.voiceSources.set(track.id, source);
-    stopElementVoice();
-  } else {
-    addElementVoice(track);
-  }
+  if (!routeVoiceThroughMixer(track)) addElementVoice(track);
 
   refreshSoundUnlock();
   if (mixerPanel && !mixerPanel.hidden) startVoiceMeter();
+}
+
+/*
+  Через Web Audio голос идёт только в рабочем AudioContext: приостановленный
+  контекст даёт тишину и неподвижную полоску уровня. Пока он не запущен,
+  дорожка звучит через <audio>, а после разблокировки звука переедет в микшер.
+*/
+function routeVoiceThroughMixer(onlyTrack) {
+  const m = state.mixer;
+  if (!m.ctx || m.ctx.state !== 'running') return false;
+  const gain = ensureMixerGain('voice');
+  if (!gain) return false;
+
+  const routes = [];
+  m.voiceTracks.forEach((track, id) => {
+    if (m.voiceSources.has(id)) return;
+    if (onlyTrack && id !== onlyTrack.id) return;
+    routes.push([id, track]);
+  });
+
+  routes.forEach(([id, track]) => {
+    try {
+      const source = m.ctx.createMediaStreamSource(new MediaStream([track]));
+      source.connect(ensureVoiceAnalyser() || gain);
+      m.voiceSources.set(id, source);
+    } catch (err) {
+      /* дорожка продолжит звучать через элемент */
+    }
+  });
+
+  if (m.voiceSources.size) stopElementVoice();
+  return onlyTrack ? m.voiceSources.has(onlyTrack.id) : m.voiceSources.size > 0;
 }
 
 function detachVoiceTrack(id) {
@@ -1824,7 +1967,13 @@ function tryResumeMixer() {
     refreshSoundUnlock();
     return;
   }
-  const done = () => refreshSoundUnlock();
+  const done = () => {
+    if (state.mixer.ctx && state.mixer.ctx.state === 'running') {
+      routeVoiceThroughMixer();
+      if (mixerPanel && !mixerPanel.hidden) startVoiceMeter();
+    }
+    refreshSoundUnlock();
+  };
   try {
     const result = ctx.resume();
     if (result && typeof result.then === 'function') result.then(done).catch(done);
@@ -2272,6 +2421,7 @@ function enterManualRoom() {
   state.inRoom = true;
   enterRoom();
   setStagePlaceholder('Ждём показ', 'Как только он включит показ, экран появится здесь.');
+  scheduleIncomingVoiceCheck();
 }
 
 /* ------------------------------------------------------------------
@@ -2385,6 +2535,7 @@ function init() {
   });
 
   if (micSettingsBtn) micSettingsBtn.addEventListener('click', () => toggleMicPanel());
+  if (audioDiagnose) audioDiagnose.addEventListener('click', runAudioDiagnostics);
   if (micSelect) {
     micSelect.addEventListener('change', () => {
       state.micDeviceId = micSelect.value;
