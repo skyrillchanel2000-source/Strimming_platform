@@ -184,7 +184,16 @@
         <div class="stage-actions">
           <button class="btn btn-primary" id="share-btn" type="button" hidden>Показать экран</button>
           <button class="btn btn-ghost" id="stop-btn" type="button" hidden>Остановить показ</button>
-          <button class="btn btn-ghost" id="mic-btn" type="button" aria-pressed="false">Микрофон</button>
+          <div class="mic" id="mic">
+            <button class="btn btn-ghost" id="mic-btn" type="button" aria-pressed="false">Микрофон</button>
+            <button class="btn btn-ghost mic-caret" id="mic-settings-btn" type="button" aria-expanded="false" aria-controls="mic-panel" aria-label="Выбор и проверка микрофона">▾</button>
+            <div class="mic-panel" id="mic-panel" role="group" aria-label="Микрофон" hidden>
+              <label class="mixer-label" for="mic-select">Устройство</label>
+              <select class="mic-select" id="mic-select"></select>
+              <div class="mic-meter" aria-hidden="true"><i id="mic-meter-bar"></i></div>
+              <p class="mic-hint" id="mic-hint">Включите микрофон — полоска покажет уровень.</p>
+            </div>
+          </div>
 
           <div class="mixer" id="mixer">
             <button class="btn btn-ghost mixer-toggle" id="mixer-btn" type="button" aria-expanded="false" aria-controls="mixer-panel">Громкость <span class="mixer-badge" id="mixer-badge">100%</span></button>

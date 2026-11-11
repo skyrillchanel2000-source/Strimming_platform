@@ -77,6 +77,13 @@ const systemVolumeOut = $('system-volume-out');
 const voiceMuteBtn = $('voice-mute');
 const mixerReset = $('mixer-reset');
 
+const micEl = $('mic');
+const micSettingsBtn = $('mic-settings-btn');
+const micPanel = $('mic-panel');
+const micSelect = $('mic-select');
+const micMeterBar = $('mic-meter-bar');
+const micHint = $('mic-hint');
+
 /* ------------------------------------------------------------------
    Состояние
    ------------------------------------------------------------------ */
@@ -97,6 +104,10 @@ const state = {
 
   micOn: false,
   micStream: null,
+  micDeviceId: '',
+  micMeterRaf: null,
+  micMeterSource: null,
+  micMeterAnalyser: null,
 
   guestPC: null,
   micTx: null,
@@ -109,6 +120,7 @@ const state = {
 
   silentTrack: null,
   audioCtx: null,
+  wakeLock: null,
 
   remoteVoiceMid: null,
 
@@ -524,6 +536,36 @@ function enterRoom() {
   }
 
   updateRoster();
+  requestWakeLock();
+  refreshMicDevices();
+}
+
+/* ------------------------------------------------------------------
+   Wake Lock: не даём экрану телефона гаснуть, пока открыта комната
+   ------------------------------------------------------------------ */
+
+async function requestWakeLock() {
+  if (!state.inRoom || document.visibilityState !== 'visible') return;
+  if (!navigator.wakeLock || typeof navigator.wakeLock.request !== 'function') return;
+  if (state.wakeLock) return;
+
+  try {
+    const sentinel = await navigator.wakeLock.request('screen');
+    state.wakeLock = sentinel;
+    sentinel.addEventListener('release', () => {
+      if (state.wakeLock === sentinel) state.wakeLock = null;
+    });
+  } catch (err) {
+    /* браузер отказал или экономит заряд — работаем как раньше */
+    state.wakeLock = null;
+  }
+}
+
+function releaseWakeLock() {
+  const sentinel = state.wakeLock;
+  state.wakeLock = null;
+  if (!sentinel) return;
+  try { sentinel.release(); } catch (err) { /* уже отпущен системой */ }
 }
 
 /* ------------------------------------------------------------------
@@ -1181,16 +1223,187 @@ function getSilentTrack() {
   }
 }
 
-async function toggleMic() {
-  if (!state.micOn) {
-    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
-      toast('Браузер не даёт доступ к микрофону.');
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+/* ------------------------------------------------------------------
+   Микрофон: выбор устройства и проверка уровня
+   ------------------------------------------------------------------ */
+
+const MIC_STORAGE_KEY = 'vmeste.mic';
+
+function loadMicDevice() {
+  try {
+    const raw = localStorage.getItem(MIC_STORAGE_KEY);
+    if (!raw) return;
+    const data = JSON.parse(raw);
+    if (data && typeof data.deviceId === 'string') state.micDeviceId = data.deviceId;
+  } catch (err) {
+    /* настройки недоступны */
+  }
+}
+
+function saveMicDevice() {
+  try {
+    localStorage.setItem(MIC_STORAGE_KEY, JSON.stringify({ deviceId: state.micDeviceId }));
+  } catch (err) {
+    /* приватный режим */
+  }
+}
+
+function micConstraints() {
+  const audio = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+  if (state.micDeviceId) audio.deviceId = { exact: state.micDeviceId };
+  return { audio };
+}
+
+async function openMicStream() {
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+    throw new Error('Браузер не даёт доступ к микрофону.');
+  }
+  try {
+    return await navigator.mediaDevices.getUserMedia(micConstraints());
+  } catch (err) {
+    if (state.micDeviceId && err && (err.name === 'OverconstrainedError' || err.name === 'NotFoundError')) {
+      state.micDeviceId = '';
+      saveMicDevice();
+      refreshMicDevices();
+      return navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
       });
+    }
+    throw err;
+  }
+}
+
+async function refreshMicDevices() {
+  if (!micSelect) return;
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== 'function') {
+    micSelect.disabled = true;
+    return;
+  }
+
+  let devices = [];
+  try {
+    const list = await navigator.mediaDevices.enumerateDevices();
+    devices = list.filter((device) => device.kind === 'audioinput' && device.deviceId);
+  } catch (err) {
+    devices = [];
+  }
+
+  micSelect.innerHTML = '';
+  const auto = document.createElement('option');
+  auto.value = '';
+  auto.textContent = 'По умолчанию';
+  micSelect.append(auto);
+
+  devices.forEach((device, index) => {
+    const option = document.createElement('option');
+    option.value = device.deviceId;
+    option.textContent = device.label || ('Микрофон ' + (index + 1));
+    micSelect.append(option);
+  });
+
+  if (devices.length && state.micDeviceId && !devices.some((device) => device.deviceId === state.micDeviceId)) {
+    state.micDeviceId = '';
+    saveMicDevice();
+  }
+  micSelect.value = state.micDeviceId;
+  micSelect.disabled = devices.length === 0;
+  updateMicPanel();
+}
+
+function updateMicPanel() {
+  if (!micPanel) return;
+  if (micHint) {
+    micHint.textContent = state.micOn
+      ? 'Скажите что-нибудь — полоска должна двигаться. Если молчит, выберите другое устройство.'
+      : 'Включите микрофон кнопкой слева — полоска покажет уровень.';
+  }
+  if (micSelect && micSelect.value !== state.micDeviceId) micSelect.value = state.micDeviceId;
+}
+
+function toggleMicPanel(force) {
+  if (!micPanel || !micSettingsBtn) return;
+  const open = typeof force === 'boolean' ? force : micPanel.hidden;
+  micPanel.hidden = !open;
+  micSettingsBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+
+  if (open) {
+    toggleMixerPanel(false);
+    refreshMicDevices();
+    updateMicPanel();
+    tryResumeMixer();
+    if (state.micOn) startMicMeter();
+  } else {
+    stopMicMeter();
+  }
+}
+
+function startMicMeter() {
+  stopMicMeter();
+  if (!state.micOn || !state.micStream || !micPanel || micPanel.hidden) return;
+  const ctx = ensureAudioCtx();
+  if (!ctx || typeof ctx.createAnalyser !== 'function') {
+    if (micHint) micHint.textContent = 'Индикатор уровня недоступен в этом браузере.';
+    return;
+  }
+  try {
+    const source = ctx.createMediaStreamSource(state.micStream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    source.connect(analyser);
+    state.micMeterSource = source;
+    state.micMeterAnalyser = analyser;
+    const data = new Uint8Array(analyser.fftSize);
+
+    const tick = () => {
+      if (!state.micMeterAnalyser) return;
+      analyser.getByteTimeDomainData(data);
+      let peak = 0;
+      for (let i = 0; i < data.length; i += 1) {
+        const value = Math.abs(data[i] - 128) / 128;
+        if (value > peak) peak = value;
+      }
+      if (micMeterBar) micMeterBar.style.width = Math.min(100, Math.round(peak * 140)) + '%';
+      state.micMeterRaf = requestAnimationFrame(tick);
+    };
+    state.micMeterRaf = requestAnimationFrame(tick);
+    tryResumeMixer();
+  } catch (err) {
+    if (micHint) micHint.textContent = 'Не удалось проверить уровень микрофона.';
+  }
+}
+
+function stopMicMeter() {
+  if (state.micMeterRaf) cancelAnimationFrame(state.micMeterRaf);
+  state.micMeterRaf = null;
+  if (state.micMeterSource) {
+    try { state.micMeterSource.disconnect(); } catch (err) { /* уже отключён */ }
+  }
+  state.micMeterSource = null;
+  state.micMeterAnalyser = null;
+  if (micMeterBar) micMeterBar.style.width = '0%';
+}
+
+async function switchMicDevice() {
+  if (!state.micOn) {
+    updateMicPanel();
+    return;
+  }
+  try {
+    const stream = await openMicStream();
+    if (state.micStream) state.micStream.getTracks().forEach((track) => track.stop());
+    state.micStream = stream;
+    applyMicTrack();
+    refreshMicDevices();
+    if (micPanel && !micPanel.hidden) startMicMeter();
+  } catch (err) {
+    toast('Не удалось переключить микрофон: ' + ((err && err.message) || 'ошибка'));
+  }
+}
+
+async function toggleMic() {
+  if (!state.micOn) {
+    try {
+      const stream = await openMicStream();
       state.micStream = stream;
       state.micOn = true;
     } catch (err) {
@@ -1198,11 +1411,7 @@ async function toggleMic() {
       return;
     }
   } else {
-  detachVoice();
-  detachSystemTrack();
-
-  if (state.micStream) state.micStream.getTracks().forEach((track) => track.stop());
-
+    if (state.micStream) state.micStream.getTracks().forEach((track) => track.stop());
     state.micStream = null;
     state.micOn = false;
   }
@@ -1216,6 +1425,14 @@ async function toggleMic() {
   micBtn.setAttribute('aria-pressed', state.micOn ? 'true' : 'false');
   micBtn.textContent = state.micOn ? 'Микрофон включён' : 'Микрофон';
   applyMicTrack();
+  updateMicPanel();
+
+  if (state.micOn) {
+    refreshMicDevices();
+    if (micPanel && !micPanel.hidden) startMicMeter();
+  } else {
+    stopMicMeter();
+  }
 }
 
 function applyMicTrack() {
@@ -1518,6 +1735,7 @@ function toggleMixerPanel(force) {
   const open = typeof force === 'boolean' ? force : mixerPanel.hidden;
   mixerPanel.hidden = !open;
   mixerBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) toggleMicPanel(false);
 }
 
 /* ------------------------------------------------------------------
@@ -1960,6 +2178,10 @@ function leaveRoom() {
     state.peer = null;
   }
 
+  detachVoice();
+  detachSystemTrack();
+  releaseWakeLock();
+
   setTimeout(() => location.reload(), 250);
 }
 
@@ -1985,6 +2207,7 @@ function init() {
 
   loadMixerState();
   renderMixer();
+  loadMicDevice();
 
   if (mixerBtn) mixerBtn.addEventListener('click', () => toggleMixerPanel());
   if (voiceVolume) {
@@ -2001,13 +2224,38 @@ function init() {
   if (mixerReset) mixerReset.addEventListener('click', resetMixer);
 
   document.addEventListener('click', (event) => {
-    if (!mixerPanel || mixerPanel.hidden) return;
-    if (mixerEl && mixerEl.contains(event.target)) return;
-    toggleMixerPanel(false);
+    if (mixerPanel && !mixerPanel.hidden && !(mixerEl && mixerEl.contains(event.target))) {
+      toggleMixerPanel(false);
+    }
+    if (micPanel && !micPanel.hidden && !(micEl && micEl.contains(event.target))) {
+      toggleMicPanel(false);
+    }
   });
+
+  if (micSettingsBtn) micSettingsBtn.addEventListener('click', () => toggleMicPanel());
+  if (micSelect) {
+    micSelect.addEventListener('change', () => {
+      state.micDeviceId = micSelect.value;
+      saveMicDevice();
+      switchMicDevice();
+    });
+  }
+  refreshMicDevices();
+  if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+    navigator.mediaDevices.addEventListener('devicechange', refreshMicDevices);
+  }
 
   document.addEventListener('pointerdown', primeAudio, { passive: true });
   document.addEventListener('keydown', primeAudio);
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      requestWakeLock();
+      tryResumeMixer();
+    } else {
+      releaseWakeLock();
+    }
+  });
 
   const manualOpen = $('manual-open');
   const manualClose = $('manual-close');
@@ -2043,6 +2291,10 @@ function init() {
 
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
+    if (micPanel && !micPanel.hidden) {
+      toggleMicPanel(false);
+      return;
+    }
     if (mixerPanel && !mixerPanel.hidden) {
       toggleMixerPanel(false);
       return;
