@@ -24,7 +24,7 @@ const PEER_LIB_URLS = [
 
 const MAX_GUESTS = 6;
 const ROOM_ID_PREFIX = 'vmeste-';
-const APP_VERSION = '2026-11-11.3';
+const APP_VERSION = '2026-11-11.4';
 
 /* ------------------------------------------------------------------
    Элементы страницы
@@ -141,7 +141,8 @@ const state = {
     systemSource: null,
     voice: 1,
     system: 1,
-    lastVoice: 1
+    lastVoice: 1,
+    audioBroken: false
   },
 
   manualMode: false,
@@ -959,6 +960,7 @@ async function handleGuestAnswer(guest, sdp) {
     if (guest.txs && guest.txs.guestMic) {
       warnIfGuestMicSilent(guest.pc, guest.txs.guestMic.mid);
     }
+    scheduleVoiceAudibleCheck();
   } catch (err) {
     toast('Соединение с гостем не установилось: ' + (err && err.message ? err.message : 'ошибка'));
   }
@@ -1133,6 +1135,7 @@ async function handleHostOffer(sdp) {
     send(state.hostConn, { t: 'answer', sdp: pc.localDescription.sdp });
     applyMicTrack();
     scheduleIncomingVoiceCheck();
+    scheduleVoiceAudibleCheck();
 
     const pending = state.pendingCandidates;
     state.pendingCandidates = [];
@@ -1530,7 +1533,124 @@ async function audioStatsRows(pc) {
   return rows.length ? rows : ['аудиопотоков нет'];
 }
 
-async function buildAudioReport() {
+async function statsBytes(pc, mid) {
+  const result = { inbound: 0, outbound: 0 };
+  if (!pc || mid == null) return result;
+  try {
+    const stats = await pc.getStats();
+    stats.forEach((report) => {
+      const audio = report.kind === 'audio' || report.mediaType === 'audio';
+      if (!audio || String(report.mid) !== String(mid)) return;
+      if (report.type === 'inbound-rtp') result.inbound += report.bytesReceived || 0;
+      if (report.type === 'outbound-rtp') result.outbound += report.bytesSent || 0;
+    });
+  } catch (err) {
+    /* статистика недоступна */
+  }
+  return result;
+}
+
+function levelPeak(analyser, ms) {
+  if (!analyser) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const data = new Uint8Array(analyser.fftSize);
+    let peak = 0;
+    const end = performance.now() + ms;
+    const tick = () => {
+      try {
+        analyser.getByteTimeDomainData(data);
+        for (let i = 0; i < data.length; i += 1) {
+          const value = Math.abs(data[i] - 128) / 128;
+          if (value > peak) peak = value;
+        }
+      } catch (err) {
+        resolve(null);
+        return;
+      }
+      if (performance.now() < end) setTimeout(tick, 40);
+      else resolve(Math.round(peak * 100));
+    };
+    tick();
+  });
+}
+
+function createMicProbe() {
+  const ctx = state.mixer.ctx;
+  const track = state.micStream ? state.micStream.getAudioTracks()[0] : null;
+  if (!ctx || ctx.state !== 'running' || !track) return null;
+  try {
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    const source = ctx.createMediaStreamSource(new MediaStream([track]));
+    source.connect(analyser);
+    analyser.cleanup = () => { try { source.disconnect(); } catch (err) { /* уже отключён */ } };
+    return analyser;
+  } catch (err) {
+    return null;
+  }
+}
+
+function activeVoicePc() {
+  if (state.role === 'host') {
+    if (state.manualMode) return state.manual.pc;
+    const first = state.guests.values().next();
+    return first && !first.done ? first.value.pc : null;
+  }
+  return state.manualMode ? state.manual.pc : state.guestPC;
+}
+
+function hostGuestMicMid() {
+  if (state.manualMode) return state.manual.guestMicTx ? state.manual.guestMicTx.mid : null;
+  const first = state.guests.values().next();
+  if (!first || first.done) return null;
+  const guest = first.value;
+  return guest.txs && guest.txs.guestMic ? guest.txs.guestMic.mid : null;
+}
+
+/*
+  Некоторые Chromium-сборки отдают принятую аудиодорожку в Web Audio пустой:
+  пакеты идут, а анализатор и колонки молчат. Тогда голос переводится на
+  обычный <audio> — он работает так же, как в первой версии сайта.
+*/
+function switchToElementVoice() {
+  const m = state.mixer;
+  if (m.audioBroken) return;
+  m.audioBroken = true;
+  m.voiceSources.forEach((source) => {
+    try { source.disconnect(); } catch (err) { /* уже отключён */ }
+  });
+  m.voiceSources.clear();
+  stopVoiceMeter();
+  m.voiceTracks.forEach((track) => addElementVoice(track));
+  addSystem('Принятый голос включён напрямую через аудиоплеер: этот браузер не отдавал его в микшер.');
+  refreshSoundUnlock();
+}
+
+async function ensureVoiceAudible() {
+  const m = state.mixer;
+  if (m.audioBroken || !m.voiceTracks.size) return;
+  if (!m.ctx || m.ctx.state !== 'running' || !m.voiceAnalyser) return;
+
+  const pc = activeVoicePc();
+  const mid = state.role === 'host' ? hostGuestMicMid() : state.remoteVoiceMid;
+  if (!pc || mid == null) return;
+
+  const before = await statsBytes(pc, mid);
+  const level = await levelPeak(m.voiceAnalyser, 2500);
+  const after = await statsBytes(pc, mid);
+
+  if (level === null || level > 0) return;
+  if (after.inbound - before.inbound < 1500) return;
+  switchToElementVoice();
+}
+
+function scheduleVoiceAudibleCheck() {
+  setTimeout(ensureVoiceAudible, 6000);
+  setTimeout(ensureVoiceAudible, 13000);
+  setTimeout(ensureVoiceAudible, 22000);
+}
+
+async function buildAudioReport(measure) {
   const m = state.mixer;
   const lines = [];
   lines.push('Версия: ' + APP_VERSION);
@@ -1541,27 +1661,44 @@ async function buildAudioReport() {
   lines.push('Микрофон: ' + (state.micOn ? trackSummary(micTrack) : 'выключен'));
   lines.push('Микшер: ' + (m.ctx ? 'AudioContext ' + m.ctx.state : 'AudioContext нет')
     + ', голос ' + Math.round(m.voice * 100) + '%'
+    + ', усиление ' + (m.voiceGain ? m.voiceGain.gain.value.toFixed(2) : '—')
     + ', источников ' + m.voiceSources.size
-    + ', дорожек ' + m.voiceTracks.size);
+    + ', дорожек ' + m.voiceTracks.size
+    + (m.audioBroken ? ', вывод через <audio>' : ''));
   const voiceTracks = Array.from(m.voiceTracks.values());
   lines.push('Голосовые дорожки: ' + (voiceTracks.length ? voiceTracks.map(trackSummary).join(', ') : '—'));
   lines.push('Звук показа: ' + (m.systemTrack ? trackSummary(m.systemTrack) : '—'));
+  if (measure) {
+    lines.push('Замер 2 с: принятый голос ' + (measure.voiceLevel == null ? '—' : measure.voiceLevel + '%')
+      + ', свой микрофон ' + (measure.micLevel == null ? '—' : measure.micLevel + '%'));
+    lines.push('За замер: вход ' + measure.inbound + ' Б, выход ' + measure.outbound + ' Б');
+  }
 
   if (state.role === 'host') {
-    if (!state.guests.size) lines.push('Гости: нет');
+    if (state.manualMode && state.manual.pc) {
+      const micTx = state.manual.micTx;
+      const guestTx = state.manual.guestMicTx;
+      lines.push('Прямое соединение: ' + state.manual.pc.connectionState);
+      lines.push('Мой микрофон: mid=' + (micTx ? micTx.mid : '—') + ' ' + (micTx ? micTx.currentDirection : '')
+        + ' (' + trackSummary(micTx && micTx.sender && micTx.sender.track) + ')');
+      lines.push('Микрофон гостя: mid=' + (guestTx ? guestTx.mid : '—') + ' ' + (guestTx ? guestTx.currentDirection : ''));
+      (await audioStatsRows(state.manual.pc)).forEach((row) => lines.push('  ' + row));
+    }
+
+    let guestsShown = 0;
     state.guests.forEach((guest) => {
+      if (!guest.pc) return;
       const tx = guest.txs || {};
-      lines.push('Гость ' + guest.name + ': соединение ' + (guest.pc ? guest.pc.connectionState : '—')
+      guestsShown += 1;
+      lines.push('Гость ' + guest.name + ': соединение ' + guest.pc.connectionState
         + '; мой микрофон mid=' + (tx.mic ? tx.mic.mid : '—') + ' ' + (tx.mic ? tx.mic.currentDirection : '')
         + ' (' + trackSummary(tx.mic && tx.mic.sender && tx.mic.sender.track) + ')'
         + '; его микрофон mid=' + (tx.guestMic ? tx.guestMic.mid : '—') + ' ' + (tx.guestMic ? tx.guestMic.currentDirection : ''));
     });
-    const hostPc = state.manual.pc;
-    if (hostPc) {
-      lines.push('Прямое соединение: ' + hostPc.connectionState);
-      (await audioStatsRows(hostPc)).forEach((row) => lines.push('  ' + row));
-    }
+    if (!guestsShown && !(state.manualMode && state.manual.pc)) lines.push('Гости: нет');
+
     for (const guest of state.guests.values()) {
+      if (!guest.pc) continue;
       (await audioStatsRows(guest.pc)).forEach((row) => lines.push('  ' + row));
     }
   } else {
@@ -1578,9 +1715,28 @@ async function buildAudioReport() {
 }
 
 async function runAudioDiagnostics() {
+  const m = state.mixer;
+  const pc = activeVoicePc();
+  const mid = state.role === 'host' ? hostGuestMicMid() : state.remoteVoiceMid;
+
+  let measure = null;
   let report = '';
   try {
-    report = await buildAudioReport();
+    const before = await statsBytes(pc, mid);
+    const micProbe = createMicProbe();
+    const levels = await Promise.all([
+      levelPeak(m.voiceAnalyser, 2000),
+      levelPeak(micProbe, 2000)
+    ]);
+    if (micProbe && micProbe.cleanup) micProbe.cleanup();
+    const after = await statsBytes(pc, mid);
+    measure = {
+      voiceLevel: levels[0],
+      micLevel: levels[1],
+      inbound: after.inbound - before.inbound,
+      outbound: after.outbound - before.outbound
+    };
+    report = await buildAudioReport(measure);
   } catch (err) {
     report = 'Не удалось собрать отчёт: ' + ((err && err.message) || 'ошибка');
   }
@@ -1784,6 +1940,12 @@ function attachVoiceTrack(track) {
 
   m.voiceTracks.set(track.id, track);
   track.addEventListener('ended', () => detachVoiceTrack(track.id));
+
+  if (m.audioBroken) {
+    addElementVoice(track);
+    refreshSoundUnlock();
+    return;
+  }
 
   if (!routeVoiceThroughMixer(track)) addElementVoice(track);
 
@@ -2339,6 +2501,7 @@ async function manualConnectAnswer() {
     enterRoom();
     setStatus('online', 'Соединение установлено');
     if (state.manual.guestMicTx) warnIfGuestMicSilent(pc, state.manual.guestMicTx.mid);
+    scheduleVoiceAudibleCheck();
   } catch (err) {
     setError('m-host', 'Ответный код не подошёл. Скопируйте его целиком, без лишних символов.');
   } finally {
@@ -2422,6 +2585,7 @@ function enterManualRoom() {
   enterRoom();
   setStagePlaceholder('Ждём показ', 'Как только он включит показ, экран появится здесь.');
   scheduleIncomingVoiceCheck();
+  scheduleVoiceAudibleCheck();
 }
 
 /* ------------------------------------------------------------------
