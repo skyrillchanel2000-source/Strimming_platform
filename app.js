@@ -24,7 +24,7 @@ const PEER_LIB_URLS = [
 
 const MAX_GUESTS = 6;
 const ROOM_ID_PREFIX = 'vmeste-';
-const APP_VERSION = '2026-11-11.1';
+const APP_VERSION = '2026-11-11.2';
 
 /* ------------------------------------------------------------------
    Элементы страницы
@@ -912,7 +912,7 @@ async function offerToGuest(guest) {
   const videoTx = pc.addTransceiver(videoTrack, { direction: 'sendonly', streams: [screen] });
   const systemTx = addSendAudio(pc, systemAudio);
   const micTx = addSendAudio(pc, micTrack);
-  const guestMicTx = pc.addTransceiver('audio', { direction: 'sendrecv' });
+  const guestMicTx = pc.addTransceiver('audio', { direction: 'recvonly' });
 
   guest.txs = { video: videoTx, system: systemTx, mic: micTx, guestMic: guestMicTx };
 
@@ -955,9 +955,50 @@ async function handleGuestAnswer(guest, sdp) {
     for (const candidate of pending) {
       try { await guest.pc.addIceCandidate(candidate); } catch (err) { /* устаревший кандидат */ }
     }
+    if (guest.txs && guest.txs.guestMic) {
+      warnIfGuestMicSilent(guest.pc, guest.txs.guestMic.mid);
+    }
   } catch (err) {
     toast('Соединение с гостем не установилось: ' + (err && err.message ? err.message : 'ошибка'));
   }
+}
+
+/*
+  Гость на устаревшей странице не привязывает свой микрофон к дорожке,
+  и хозяин не получает от него ни одного пакета. Без подсказки это выглядит
+  как поломка: экран идёт, голос хозяина слышен, а обратного звука нет.
+*/
+function warnIfGuestMicSilent(pc, mid, attempt) {
+  if (!pc || mid == null) return;
+  const round = attempt || 0;
+
+  setTimeout(async () => {
+    if (round > 1) return;
+    if (pc.connectionState === 'new' || pc.connectionState === 'connecting') {
+      warnIfGuestMicSilent(pc, mid, round + 1);
+      return;
+    }
+    if (pc.connectionState !== 'connected') return;
+
+    let found = false;
+    let bytes = 0;
+    try {
+      const stats = await pc.getStats();
+      stats.forEach((report) => {
+        if (report.type !== 'inbound-rtp') return;
+        if (report.kind !== 'audio' && report.mediaType !== 'audio') return;
+        if (String(report.mid) !== String(mid)) return;
+        found = true;
+        bytes = report.bytesReceived || 0;
+      });
+    } catch (err) {
+      return;
+    }
+
+    if (found && bytes > 0) return;
+    addSystem('Микрофон собеседника не передаётся. Если у него открыта старая версия страницы, попросите перезагрузить её (Ctrl+F5).');
+    toast('Звук от собеседника не идёт. Частая причина — устаревшая версия страницы у собеседника.');
+  }, 6000);
 }
 
 function handleGuestIce(guest, candidate) {
@@ -2086,7 +2127,7 @@ async function manualCreateInvite() {
       pc,
       state.micOn && state.micStream ? state.micStream.getAudioTracks()[0] : getSilentTrack()
     );
-    state.manual.guestMicTx = pc.addTransceiver('audio', { direction: 'sendrecv' });
+    state.manual.guestMicTx = pc.addTransceiver('audio', { direction: 'recvonly' });
 
     attachManualChannel(pc.createDataChannel('vmeste', { ordered: true }), 'host');
 
@@ -2148,6 +2189,7 @@ async function manualConnectAnswer() {
     state.inRoom = true;
     enterRoom();
     setStatus('online', 'Соединение установлено');
+    if (state.manual.guestMicTx) warnIfGuestMicSilent(pc, state.manual.guestMicTx.mid);
   } catch (err) {
     setError('m-host', 'Ответный код не подошёл. Скопируйте его целиком, без лишних символов.');
   } finally {
