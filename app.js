@@ -76,6 +76,7 @@ const systemVolume = $('system-volume');
 const systemVolumeOut = $('system-volume-out');
 const voiceMuteBtn = $('voice-mute');
 const mixerReset = $('mixer-reset');
+const voiceMeterBar = $('voice-meter-bar');
 
 const micEl = $('mic');
 const micSettingsBtn = $('mic-settings-btn');
@@ -128,6 +129,8 @@ const state = {
     ctx: null,
     voiceGain: null,
     systemGain: null,
+    voiceAnalyser: null,
+    voiceMeterRaf: null,
     voiceTracks: new Map(),
     voiceSources: new Map(),
     systemTrack: null,
@@ -1492,6 +1495,49 @@ function ensureMixerGain(kind) {
   return gain;
 }
 
+function ensureVoiceAnalyser() {
+  const m = state.mixer;
+  if (m.voiceAnalyser) return m.voiceAnalyser;
+  const gain = ensureMixerGain('voice');
+  if (!gain || !m.ctx || typeof m.ctx.createAnalyser !== 'function') return null;
+  const analyser = m.ctx.createAnalyser();
+  analyser.fftSize = 1024;
+  analyser.connect(gain);
+  m.voiceAnalyser = analyser;
+  return analyser;
+}
+
+function startVoiceMeter() {
+  stopVoiceMeter();
+  const m = state.mixer;
+  if (!mixerPanel || mixerPanel.hidden || !m.voiceAnalyser) return;
+
+  const analyser = m.voiceAnalyser;
+  const data = new Uint8Array(analyser.fftSize);
+
+  const tick = () => {
+    if (!m.voiceAnalyser) return;
+    analyser.getByteTimeDomainData(data);
+    let peak = 0;
+    for (let i = 0; i < data.length; i += 1) {
+      const value = Math.abs(data[i] - 128) / 128;
+      if (value > peak) peak = value;
+    }
+    if (voiceMeterBar) voiceMeterBar.style.width = Math.min(100, Math.round(peak * 140)) + '%';
+    m.voiceMeterRaf = requestAnimationFrame(tick);
+  };
+
+  m.voiceMeterRaf = requestAnimationFrame(tick);
+  tryResumeMixer();
+}
+
+function stopVoiceMeter() {
+  const m = state.mixer;
+  if (m.voiceMeterRaf) cancelAnimationFrame(m.voiceMeterRaf);
+  m.voiceMeterRaf = null;
+  if (voiceMeterBar) voiceMeterBar.style.width = '0%';
+}
+
 function applyGain(kind) {
   const m = state.mixer;
   const gain = kind === 'voice' ? m.voiceGain : m.systemGain;
@@ -1519,9 +1565,10 @@ function attachVoiceTrack(track) {
   const gain = ensureMixerGain('voice');
   let source = null;
   if (gain && m.ctx) {
+    const destination = ensureVoiceAnalyser() || gain;
     try {
       source = m.ctx.createMediaStreamSource(new MediaStream([track]));
-      source.connect(gain);
+      source.connect(destination);
     } catch (err) {
       source = null;
     }
@@ -1535,6 +1582,7 @@ function attachVoiceTrack(track) {
   }
 
   refreshSoundUnlock();
+  if (mixerPanel && !mixerPanel.hidden) startVoiceMeter();
 }
 
 function detachVoiceTrack(id) {
@@ -1735,7 +1783,13 @@ function toggleMixerPanel(force) {
   const open = typeof force === 'boolean' ? force : mixerPanel.hidden;
   mixerPanel.hidden = !open;
   mixerBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
-  if (open) toggleMicPanel(false);
+
+  if (open) {
+    startVoiceMeter();
+    toggleMicPanel(false);
+  } else {
+    stopVoiceMeter();
+  }
 }
 
 /* ------------------------------------------------------------------

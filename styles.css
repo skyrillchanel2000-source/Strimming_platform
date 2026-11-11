@@ -593,14 +593,21 @@ ul { padding: 0; list-style: none; }
   box-shadow: 0 0 0 3px rgba(255, 178, 87, 0.12);
 }
 
-.mic-meter {
+.mixer-level {
+  display: grid;
+  gap: 5px;
+}
+
+.mic-meter,
+.mixer-meter {
   height: 10px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.07);
   overflow: hidden;
 }
 
-.mic-meter i {
+.mic-meter i,
+.mixer-meter i {
   display: block;
   width: 0;
   height: 100%;
