@@ -24,6 +24,7 @@ const PEER_LIB_URLS = [
 
 const MAX_GUESTS = 6;
 const ROOM_ID_PREFIX = 'vmeste-';
+const APP_VERSION = '2026-11-11.1';
 
 /* ------------------------------------------------------------------
    Элементы страницы
@@ -84,6 +85,8 @@ const micPanel = $('mic-panel');
 const micSelect = $('mic-select');
 const micMeterBar = $('mic-meter-bar');
 const micHint = $('mic-hint');
+const micStatus = $('mic-status');
+const versionEl = $('app-version');
 
 /* ------------------------------------------------------------------
    Состояние
@@ -520,6 +523,7 @@ function enterRoom() {
 
   stageVideo.muted = true;
   renderMixer();
+  updateMicPanel();
 
   if (state.role === 'host') {
     updateShareButtons();
@@ -908,7 +912,7 @@ async function offerToGuest(guest) {
   const videoTx = pc.addTransceiver(videoTrack, { direction: 'sendonly', streams: [screen] });
   const systemTx = addSendAudio(pc, systemAudio);
   const micTx = addSendAudio(pc, micTrack);
-  const guestMicTx = pc.addTransceiver('audio', { direction: 'recvonly' });
+  const guestMicTx = pc.addTransceiver('audio', { direction: 'sendrecv' });
 
   guest.txs = { video: videoTx, system: systemTx, mic: micTx, guestMic: guestMicTx };
 
@@ -977,6 +981,7 @@ function closeGuestPC(guest) {
       detachVoiceTrack(guest.voiceTrack.id);
       guest.voiceTrack = null;
     }
+    updateMicStatus();
   }
 }
 
@@ -1084,6 +1089,7 @@ async function handleHostOffer(sdp) {
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     send(state.hostConn, { t: 'answer', sdp: pc.localDescription.sdp });
+    applyMicTrack();
 
     const pending = state.pendingCandidates;
     state.pendingCandidates = [];
@@ -1098,9 +1104,8 @@ async function handleHostOffer(sdp) {
 
 /*
   Хозяин присылает: видео (sendonly), звук системы (sendonly),
-  свой микрофон (sendonly) и пустую дорожку под микрофон гостя (recvonly).
-  На стороне гостя направления нужно развернуть, иначе последняя дорожка
-  останется «только для приёма» и микрофон не заработает.
+  свой микрофон (sendonly) и двустороннюю аудиодорожку под микрофон гостя.
+  Гость разворачивает направления и вешает свой микрофон на последнюю аудиодорожку.
 */
 async function applyReverseDirections(pc, offerSdp) {
   const lines = parseMediaSections(offerSdp);
@@ -1113,7 +1118,10 @@ async function applyReverseDirections(pc, offerSdp) {
     try { tx.direction = direction; } catch (err) { /* направление недоступно */ }
   });
 
-  const micIndex = lines.findIndex((line) => line.kind === 'audio' && line.direction === 'recvonly');
+  const audioIndexes = lines
+    .map((line, index) => (line.kind === 'audio' ? index : -1))
+    .filter((index) => index >= 0);
+  const micIndex = audioIndexes.length ? audioIndexes[audioIndexes.length - 1] : -1;
   if (micIndex === -1) return;
 
   const micTx = transceiverByIndex(transceivers, micIndex);
@@ -1202,6 +1210,7 @@ function guestStopPlayback() {
   detachSystemTrack();
   stageVideo.srcObject = null;
   soundUnlock.hidden = true;
+  updateMicStatus();
 }
 
 /* ------------------------------------------------------------------
@@ -1321,6 +1330,31 @@ function updateMicPanel() {
       : 'Включите микрофон кнопкой слева — полоска покажет уровень.';
   }
   if (micSelect && micSelect.value !== state.micDeviceId) micSelect.value = state.micDeviceId;
+  updateMicStatus();
+}
+
+function updateMicStatus() {
+  if (!micStatus) return;
+  if (!state.micOn) {
+    micStatus.textContent = 'Передача: микрофон выключен';
+    micStatus.className = 'mic-status';
+    return;
+  }
+
+  let ok = false;
+  if (state.role === 'host') {
+    ok = Array.from(state.guests.values()).some((guest) => (
+      guest.txs && guest.txs.mic && guest.txs.mic.sender && guest.txs.mic.sender.track
+    ));
+  } else {
+    const tx = state.micTx || findGuestMicTx();
+    const track = tx && tx.sender && tx.sender.track;
+    const direction = tx && tx.currentDirection;
+    ok = !!(track && track.readyState === 'live' && (!direction || direction === 'sendonly' || direction === 'sendrecv'));
+  }
+
+  micStatus.textContent = ok ? 'Передача: идёт' : 'Передача: соединение ещё не готово';
+  micStatus.className = 'mic-status ' + (ok ? 'is-ok' : 'is-bad');
 }
 
 function toggleMicPanel(force) {
@@ -1438,11 +1472,24 @@ async function toggleMic() {
   }
 }
 
+function findGuestMicTx() {
+  const pc = state.manualMode ? state.manual.pc : state.guestPC;
+  if (!pc) return null;
+  const audioTxs = pc.getTransceivers().filter((tx) => (
+    tx.receiver && tx.receiver.track && tx.receiver.track.kind === 'audio'
+  ));
+  return audioTxs.length ? audioTxs[audioTxs.length - 1] : null;
+}
+
 function applyMicTrack() {
   const track = state.micOn && state.micStream ? state.micStream.getAudioTracks()[0] : getSilentTrack();
 
   if (state.manualMode) {
-    const tx = state.role === 'host' ? state.manual.micTx : state.micTx;
+    let tx = state.role === 'host' ? state.manual.micTx : state.micTx;
+    if (!tx && state.role !== 'host') {
+      tx = findGuestMicTx();
+      state.micTx = tx;
+    }
     if (tx) tx.sender.replaceTrack(track || null).catch(() => {});
     return;
   }
@@ -1451,9 +1498,16 @@ function applyMicTrack() {
     state.guests.forEach((guest) => {
       if (guest.txs && guest.txs.mic) guest.txs.mic.sender.replaceTrack(track || null).catch(() => {});
     });
-  } else if (state.micTx) {
-    state.micTx.sender.replaceTrack(track || null).catch(() => {});
+  } else {
+    let tx = state.micTx;
+    if (!tx) {
+      tx = findGuestMicTx();
+      state.micTx = tx;
+    }
+    if (tx) tx.sender.replaceTrack(track || null).catch(() => {});
   }
+
+  updateMicStatus();
 }
 
 /* ------------------------------------------------------------------
@@ -2032,7 +2086,7 @@ async function manualCreateInvite() {
       pc,
       state.micOn && state.micStream ? state.micStream.getAudioTracks()[0] : getSilentTrack()
     );
-    state.manual.guestMicTx = pc.addTransceiver('audio', { direction: 'recvonly' });
+    state.manual.guestMicTx = pc.addTransceiver('audio', { direction: 'sendrecv' });
 
     attachManualChannel(pc.createDataChannel('vmeste', { ordered: true }), 'host');
 
@@ -2151,6 +2205,7 @@ async function manualMakeAnswer() {
     await applyReverseDirections(pc, sdp);
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
+    applyMicTrack();
     await waitForIce(pc);
 
     $('m-answer-out').value = await encodeCode(pc.localDescription.sdp);
@@ -2262,6 +2317,7 @@ function init() {
   loadMixerState();
   renderMixer();
   loadMicDevice();
+  if (versionEl) versionEl.textContent = 'Версия ' + APP_VERSION;
 
   if (mixerBtn) mixerBtn.addEventListener('click', () => toggleMixerPanel());
   if (voiceVolume) {
